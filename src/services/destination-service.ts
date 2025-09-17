@@ -15,20 +15,28 @@ export class DestinationService {
     }
 
     async initialize(): Promise<void> {
+        // Load VCAP services if available, but don't fail locally when not bound
         try {
             // Load VCAP services
             xsenv.loadEnv();
-            this.vcapServices = xsenv.getServices({
-                destination: { label: 'destination' },
-                connectivity: { label: 'connectivity' },
-                xsuaa: { label: 'xsuaa' }
-            });
 
-            this.logger.info('Destination service initialized successfully');
+            try {
+                this.vcapServices = xsenv.getServices({
+                    destination: { label: 'destination' },
+                    connectivity: { label: 'connectivity' },
+                    xsuaa: { label: 'xsuaa' }
+                });
+                this.logger.info('Destination service initialized successfully (BTP services detected)');
+            } catch (serviceError) {
+                // No matching services in local mode - proceed with env-based destinations
+                this.vcapServices = {};
+                this.logger.warn('No BTP Destination/Connectivity/XSUAA services found. Continuing with environment-based destinations.');
+            }
 
         } catch (error) {
-            this.logger.error('Failed to initialize destination service:', error);
-            throw error;
+            // Even loading env failed - continue with empty services for local usage
+            this.vcapServices = {};
+            this.logger.warn('Failed to load VCAP services. Continuing with environment-based destinations.');
         }
     }
 
@@ -69,9 +77,11 @@ export class DestinationService {
 
         try {
             // First try environment variables (for local development)
-            const envDestinations = process.env.destinations;
+            const envDestinations = process.env.destinations || process.env.DESTINATIONS;
             if (envDestinations) {
                 const destinations = JSON.parse(envDestinations);
+
+                // Try to find by configured name
                 const envDest = destinations.find((d: Record<string, unknown>) => d.name === destinationName);
                 if (envDest) {
                     this.logger.info(`Successfully retrieved destination '${destinationName}' from environment variable.`);
@@ -79,6 +89,18 @@ export class DestinationService {
                         url: envDest.url,
                         username: envDest.username,
                         password: envDest.password,
+                        authentication: 'BasicAuthentication'
+                    } as HttpDestination;
+                }
+
+                // Fallback: If only one destination is defined, use it regardless of name
+                if (Array.isArray(destinations) && destinations.length === 1) {
+                    const single = destinations[0] as Record<string, unknown>;
+                    this.logger.info(`Using the only configured environment destination '${single.name as string}'.`);
+                    return {
+                        url: single.url as string,
+                        username: single.username as string,
+                        password: single.password as string,
                         authentication: 'BasicAuthentication'
                     } as HttpDestination;
                 }
