@@ -841,28 +841,56 @@ export function createApp(): express.Application {
 
     // OAuth endpoint for token exchange
     const tokenHandler = async (req: Request, res: Response) => {
-        logger.info(`Start OAuth token exchange flow`);
+        logger.info(`Start OAuth token exchange flow - grant_type: ${req.body?.grant_type}`);
         const baseUrl = getBaseUrl(req);
         try {
             if (!authService.isConfigured()) {
                 return res.status(501).json({
-                    error: 'OAuth not configured',
-                    message: 'XSUAA service is not configured for this deployment'
+                    error: 'oauth_not_configured',
+                    error_description: 'XSUAA service is not configured for this deployment'
                 });
             }
+
+            const grantType = req.body?.grant_type;
             let tokenData;
-            if (req?.body?.code) {
-                tokenData = await authService.exchangeCodeForToken(req.body.code, authService.getRedirectUri(baseUrl));
-            }
-            if (req?.body?.refresh_token) {
-                tokenData = await authService.refreshAccessToken(req.body.refresh_token);
+
+            if (grantType === 'authorization_code' || req.body?.code) {
+                // Authorization code flow
+                const code = req.body.code;
+                if (!code) {
+                    return res.status(400).json({
+                        error: 'invalid_request',
+                        error_description: 'Missing required parameter: code'
+                    });
+                }
+                logger.info('Processing authorization_code grant');
+                tokenData = await authService.exchangeCodeForToken(code, authService.getRedirectUri(baseUrl));
+            } else if (grantType === 'refresh_token' || req.body?.refresh_token) {
+                // Refresh token flow
+                const refreshToken = req.body.refresh_token;
+                if (!refreshToken) {
+                    return res.status(400).json({
+                        error: 'invalid_request',
+                        error_description: 'Missing required parameter: refresh_token'
+                    });
+                }
+                logger.info('Processing refresh_token grant');
+                tokenData = await authService.refreshAccessToken(refreshToken);
+            } else {
+                return res.status(400).json({
+                    error: 'unsupported_grant_type',
+                    error_description: 'Supported grant types: authorization_code, refresh_token'
+                });
             }
 
-            logger.info(`OAuth token exchange successful`);
+            logger.info(`OAuth token exchange successful - grant_type: ${grantType}`);
             res.json(tokenData);
         } catch (error) {
-            logger.error('Failed to initiate OAuth flow:', error);
-            res.status(500).json({ error: 'Failed to initiate OAuth flow' });
+            logger.error('OAuth token exchange failed:', error);
+            res.status(400).json({
+                error: 'invalid_grant',
+                error_description: error instanceof Error ? error.message : 'Token exchange failed'
+            });
         }
     };
     app.get('/oauth/token', tokenHandler);
@@ -959,19 +987,27 @@ export function createApp(): express.Application {
         }
     });
 
-    // Token refresh endpoint
+    // Token refresh endpoint - Alternative endpoint for refresh (also handled by /oauth/token)
     app.post('/oauth/refresh', async (req, res) => {
         try {
-            const { refreshToken } = req.body;
+            const refreshToken = req.body?.refreshToken || req.body?.refresh_token;
             if (!refreshToken) {
-                return res.status(400).json({ error: 'Refresh token not provided' });
+                return res.status(400).json({
+                    error: 'invalid_request',
+                    error_description: 'Refresh token not provided. Include refreshToken or refresh_token in request body.'
+                });
             }
 
+            logger.info('Processing token refresh via /oauth/refresh endpoint');
             const tokenData = await authService.refreshAccessToken(refreshToken);
+            logger.info('Token refresh successful');
             res.json(tokenData);
         } catch (error) {
             logger.error('Token refresh failed:', error);
-            res.status(401).json({ error: 'Token refresh failed' });
+            res.status(401).json({
+                error: 'invalid_grant',
+                error_description: error instanceof Error ? error.message : 'Token refresh failed'
+            });
         }
     });
 

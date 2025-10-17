@@ -96,7 +96,7 @@ export class AuthService {
     /**
      * Refresh an access token using a refresh token
      */
-    async refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; refreshToken?: string; expiresIn: number }> {
+    async refreshAccessToken(refreshToken: string): Promise<{ access_token: string; refresh_token?: string; expires_in: number; token_type?: string }> {
         if (!this.xsuaaCredentials) {
             throw new Error('XSUAA service not configured');
         }
@@ -122,11 +122,20 @@ export class AuthService {
 
             if (!response.ok) {
                 const errorText = await response.text();
+                this.logger.error(`Token refresh HTTP error: ${response.status} - ${errorText}`);
                 throw new Error(`Token refresh failed: ${response.status} - ${errorText}`);
             }
 
             const tokenData = await response.json();
-            return tokenData;
+            this.logger.info('Token refresh successful');
+
+            // Return the token data in the same format as XSUAA (snake_case)
+            return {
+                access_token: tokenData.access_token,
+                refresh_token: tokenData.refresh_token,
+                expires_in: tokenData.expires_in,
+                token_type: tokenData.token_type || 'bearer'
+            };
         } catch (error) {
             this.logger.error('Failed to refresh token:', error);
             throw error;
