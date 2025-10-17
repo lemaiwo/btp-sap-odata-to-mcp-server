@@ -44,18 +44,16 @@ export class HierarchicalSAPToolRegistry {
     public async registerDiscoveryTools(): Promise<void> {
         this.logger.info(`🔧 Registering intelligent discovery tools for ${this.discoveredServices.length} services`);
 
-        // Tool 1: Intelligent universal discovery
+        // Tool 1: Intelligent universal discovery - SIMPLIFIED to query-only interface
         this.mcpServer.registerTool(
             "discover-sap-data",
             {
                 title: "Discover SAP Data",
-                description: "AUTHENTICATION AWARE: Intelligent universal discovery tool for SAP OData services, entities, and properties. ⚠️ ALWAYS returns COMPLETE schemas with ALL property details in a SINGLE call. ⚠️ NEVER call this tool twice for the same entity - all information is included in the first response. After calling this tool, proceed IMMEDIATELY to execute-sap-operation. Discovery uses technical user, but data operations require user authentication. This is your single tool for ALL SAP data discovery.",
+                description: "AUTHENTICATION AWARE: Universal search tool for SAP OData services, entities, and properties. ⚠️ ALWAYS returns COMPLETE schemas with ALL property details in a SINGLE call. ⚠️ This is the ONLY discovery call you need - all information (services, entities, properties, types, keys, capabilities) is included in ONE response. After calling this tool ONCE, proceed IMMEDIATELY to execute-sap-operation. NEVER call discover-sap-data twice. Discovery uses technical user, but data operations require user authentication.",
                 inputSchema: {
-                    query: z.string().optional().describe("Search term to find services, entities, or properties. Searches across service names, entity names, and property names. Examples: 'customer', 'email', 'sales order'. ⚠️ IMPORTANT: Returns FULL entity schemas with ALL property details in ONE call - do NOT call discover-sap-data again after receiving results."),
+                    query: z.string().optional().describe("Search term to find services, entities, or properties. Searches across service names, entity names, and property names. Examples: 'customer', 'email', 'sales order'. If omitted, returns ALL available services and entities. Returns FULL entity schemas with ALL property details in ONE call - you will have EVERYTHING you need after this single call."),
                     category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search results to specific business area. If no results found with specified category, automatically retries with 'all' categories in the same request."),
-                    serviceId: z.string().optional().describe("Direct access to a specific service. When provided without entityName, returns service details with all entities and FULL schemas. When provided with entityName, returns FULL entity schema. ⚠️ After receiving the full schema, proceed directly to execute-sap-operation - do NOT call discover-sap-data again. IMPORTANT: Use the 'id' field from previous results, NOT the 'title' field."),
-                    entityName: z.string().optional().describe("Direct access to a specific entity. Requires serviceId. Returns COMPLETE entity schema with ALL properties, types, keys, and constraints in ONE call. ⚠️ After receiving this, you have everything needed - proceed directly to execute-sap-operation. IMPORTANT: Use the 'name' field from previous results, NOT the 'entitySet' field."),
-                    limit: z.number().min(1).max(20).optional().describe("Maximum number of results to return when searching. Default: 10")
+                    limit: z.number().min(1).max(20).optional().describe("Maximum number of results to return. Default: 10. Use this to control result set size.")
                 }
             },
             async (args: Record<string, unknown>) => {
@@ -150,42 +148,19 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
-     * Intelligent unified discovery method - handles all discovery scenarios
+     * Intelligent unified discovery method - SIMPLIFIED to query-only interface
      * Always returns full schemas for maximum efficiency (avoids follow-up requests)
      *
      * Behavior:
-     * 1. serviceId + entityName → Full entity schema (direct access)
-     * 2. serviceId only → Service + all entities with full schemas
-     * 3. query/category → Search with full schemas, automatic fallback to 'all' if needed
+     * - If query provided: Search with that term
+     * - If no query and no category: Return ALL services and entities
+     * - If category provided: Filter by that category
+     * - Returns COMPLETE entity information in ONE call
+     * - No need for follow-up calls with serviceId/entityName
      */
     private async discoverDataUnified(args: Record<string, unknown>) {
-        const serviceId = args.serviceId as string | undefined;
-        const entityName = args.entityName as string | undefined;
-        const query = args.query as string | undefined;
-
-        // Case 1: Direct entity access → Return FULL schema
-        if (serviceId && entityName) {
-            return this.getEntitySchema({ serviceId, entityName });
-        }
-
-        // Case 2: Service access → Return service + entities with full schemas
-        if (serviceId) {
-            return this.discoverServiceEntities(args);
-        }
-
-        // Case 3: Search mode - always return full schemas
-        if (query !== undefined || args.category !== undefined) {
-            return this.searchServicesAndEntities(args);
-        }
-
-        // No valid parameters provided
-        return {
-            content: [{
-                type: "text" as const,
-                text: `ERROR: Please provide either 'query', 'category', 'serviceId', or 'serviceId + entityName' to discover SAP data.\n\nExamples:\n- Search: { query: "customer" }\n- Service entities: { serviceId: "API_SALES_ORDER_SRV" }\n- Entity schema: { serviceId: "API_SALES_ORDER_SRV", entityName: "SalesOrder" }`
-            }],
-            isError: true
-        };
+        // Always use search method - it handles empty queries and returns everything
+        return this.searchServicesAndEntities(args);
     }
 
     /**
@@ -525,6 +500,9 @@ export class HierarchicalSAPToolRegistry {
     /**
      * Discover entities within a service with full schemas
      * Always returns complete property details for maximum efficiency
+     *
+     * NOTE: This method is kept for potential future use but is NOT exposed via the tool interface.
+     * The query-based search already returns full schemas, making this redundant.
      */
     private async discoverServiceEntities(args: Record<string, unknown>) {
         try {
@@ -630,6 +608,9 @@ export class HierarchicalSAPToolRegistry {
 
     /**
      * Get detailed entity schema information
+     *
+     * NOTE: This method is kept for potential future use but is NOT exposed via the tool interface.
+     * The query-based search already returns full schemas, making this redundant.
      */
     private async getEntitySchema(args: Record<string, unknown>) {
         try {
@@ -1108,23 +1089,19 @@ Authentication Requirements:
 
 You have access to 2 intelligent tools:
 
-1. discover-sap-data (INTELLIGENT UNIVERSAL DISCOVERY)
+1. discover-sap-data (UNIVERSAL SEARCH - COMPLETE RESULTS IN ONE CALL)
 - Purpose: Single tool for ALL discovery - services, entities, AND properties
-- Intelligence: Automatically returns the right detail level
-  - Search mode (query) → Summary with relevance scores
-  - Direct access (serviceId + entityName) → Full schema
-  - Service view (serviceId only) → Entities summary
+- Returns: COMPLETE schemas with ALL property details in ONE call
 - Parameters:
-  - query: Search across services, entities, properties
-  - category: Filter by business area
-  - serviceId: Direct service access
-  - entityName: Direct entity access (full schema)
-  - includeFullSchema: Force full detail in searches
+  - query (REQUIRED): Search across services, entities, properties
+  - category (optional): Filter by business area (business-partner, sales, finance, etc.)
+  - limit (optional): Maximum results to return (default: 10)
 - Examples:
-  - "Find customer email" → Searches everything
-  - { serviceId: "X", entityName: "Y" } → Full schema
-  - { query: "sales" } → Summary with scores
-- This ONE tool handles ALL discovery needs
+  - { query: "customer" } → Returns FULL customer entity schemas
+  - { query: "email" } → Returns all entities with email properties
+  - { query: "sales order", category: "sales" } → Returns sales order entities with FULL schemas
+- ⚠️ CRITICAL: Returns EVERYTHING in ONE call - DO NOT call again with serviceId/entityName
+- This ONE tool call gives you ALL the information you need
 
 2. execute-sap-operation
 - Purpose: Perform CRUD operations on entities
