@@ -10,7 +10,9 @@
       "Bash(npx eslint:*)",
       "Bash(npx tsc:*)",
       "Bash(grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(git checkout:*)",
+      "Bash(git restore:*)"
     ],
     "deny": [],
     "ask": []

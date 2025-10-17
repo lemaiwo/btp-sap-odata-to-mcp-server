@@ -49,13 +49,12 @@ export class HierarchicalSAPToolRegistry {
             "discover-sap-data",
             {
                 title: "Discover SAP Data",
-                description: "AUTHENTICATION AWARE: Intelligent universal discovery tool for SAP OData services, entities, and properties. Automatically returns the right level of detail based on your query: summary for searches, full schema for direct access. Discovery uses technical user, but data operations require user authentication. This is your single tool for ALL SAP data discovery.",
+                description: "AUTHENTICATION AWARE: Intelligent universal discovery tool for SAP OData services, entities, and properties. ⚠️ ALWAYS returns COMPLETE schemas with ALL property details in a SINGLE call. ⚠️ NEVER call this tool twice for the same entity - all information is included in the first response. After calling this tool, proceed IMMEDIATELY to execute-sap-operation. Discovery uses technical user, but data operations require user authentication. This is your single tool for ALL SAP data discovery.",
                 inputSchema: {
-                    query: z.string().optional().describe("Search term to find services, entities, or properties. Searches across service names, entity names, and property names. Examples: 'customer', 'email', 'sales order'. Returns summary information with match relevance."),
-                    category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search results to specific business area."),
-                    serviceId: z.string().optional().describe("Direct access to a specific service. When provided without entityName, returns service details with all entities (summary). When provided with entityName, returns full entity schema. IMPORTANT: Use the 'id' field from previous results, NOT the 'title' field."),
-                    entityName: z.string().optional().describe("Direct access to a specific entity. Requires serviceId. Returns FULL entity schema with all properties, types, keys, and constraints. IMPORTANT: Use the 'name' field from previous results, NOT the 'entitySet' field."),
-                    includeFullSchema: z.boolean().optional().describe("Force full schema in search results. Default: false for searches, true when entityName is provided. Set to true if you need complete property details for all search matches."),
+                    query: z.string().optional().describe("Search term to find services, entities, or properties. Searches across service names, entity names, and property names. Examples: 'customer', 'email', 'sales order'. ⚠️ IMPORTANT: Returns FULL entity schemas with ALL property details in ONE call - do NOT call discover-sap-data again after receiving results."),
+                    category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search results to specific business area. If no results found with specified category, automatically retries with 'all' categories in the same request."),
+                    serviceId: z.string().optional().describe("Direct access to a specific service. When provided without entityName, returns service details with all entities and FULL schemas. When provided with entityName, returns FULL entity schema. ⚠️ After receiving the full schema, proceed directly to execute-sap-operation - do NOT call discover-sap-data again. IMPORTANT: Use the 'id' field from previous results, NOT the 'title' field."),
+                    entityName: z.string().optional().describe("Direct access to a specific entity. Requires serviceId. Returns COMPLETE entity schema with ALL properties, types, keys, and constraints in ONE call. ⚠️ After receiving this, you have everything needed - proceed directly to execute-sap-operation. IMPORTANT: Use the 'name' field from previous results, NOT the 'entitySet' field."),
                     limit: z.number().min(1).max(20).optional().describe("Maximum number of results to return when searching. Default: 10")
                 }
             },
@@ -151,33 +150,32 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
-     * Intelligent unified discovery method - handles all discovery scenarios with context-aware detail levels
+     * Intelligent unified discovery method - handles all discovery scenarios
+     * Always returns full schemas for maximum efficiency (avoids follow-up requests)
      *
      * Behavior:
      * 1. serviceId + entityName → Full entity schema (direct access)
-     * 2. serviceId only → Service + entities summary
-     * 3. query + includeFullSchema → Search with full schemas
-     * 4. query only → Search with summary (efficient)
+     * 2. serviceId only → Service + all entities with full schemas
+     * 3. query/category → Search with full schemas, automatic fallback to 'all' if needed
      */
     private async discoverDataUnified(args: Record<string, unknown>) {
         const serviceId = args.serviceId as string | undefined;
         const entityName = args.entityName as string | undefined;
         const query = args.query as string | undefined;
-        const includeFullSchema = args.includeFullSchema as boolean | undefined;
 
         // Case 1: Direct entity access → Return FULL schema
         if (serviceId && entityName) {
             return this.getEntitySchema({ serviceId, entityName });
         }
 
-        // Case 2: Service access → Return service + entities summary
+        // Case 2: Service access → Return service + entities with full schemas
         if (serviceId) {
             return this.discoverServiceEntities(args);
         }
 
-        // Case 3 & 4: Search mode
+        // Case 3: Search mode - always return full schemas
         if (query !== undefined || args.category !== undefined) {
-            return this.searchServicesAndEntities(args, includeFullSchema || false);
+            return this.searchServicesAndEntities(args);
         }
 
         // No valid parameters provided
@@ -191,125 +189,189 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
-     * Intelligent search across services, entities, and properties
-     * Returns different detail levels based on includeFullSchema flag
+     * Helper method to check if text matches query (supports multi-word queries)
+     * Returns true if:
+     * - Single word: text contains the word
+     * - Multiple words separated: text contains ALL words
      */
-    private async searchServicesAndEntities(args: Record<string, unknown>, includeFullSchema: boolean) {
-        try {
-            const query = (args.query as string)?.toLowerCase() || "";
-            let category = (args.category as string)?.toLowerCase() || "all";
-            const limit = (args.limit as number) || 10;
+    private matchesQuery(text: string, query: string, searchMode: 'combined' | 'separated'): boolean {
+        if (!query) return false;
 
-            // Validate category
-            const validCategories = ["business-partner", "sales", "finance", "procurement", "hr", "logistics", "all"];
-            if (!validCategories.includes(category)) {
-                category = "all";
+        const textLower = text.toLowerCase();
+
+        if (searchMode === 'combined') {
+            // Try as combined query (e.g., "userparameters")
+            return textLower.includes(query);
+        } else {
+            // Try as separated words (e.g., "user" AND "parameters")
+            const words = query.split(/\s+/).filter(w => w.length > 0);
+            if (words.length === 0) return false;
+            if (words.length === 1) return textLower.includes(words[0]);
+
+            // All words must be present
+            return words.every(word => textLower.includes(word));
+        }
+    }
+
+    /**
+     * Helper method to perform search across services and entities for a given category
+     * Extracts common search logic to avoid duplication in fallback scenario
+     * Supports multi-word queries with intelligent matching
+     */
+    private performCategorySearch(query: string, category: string, searchMode: 'combined' | 'separated' = 'combined'): any[] {
+        const matches: any[] = [];
+
+        // Search across all services
+        for (const service of this.discoveredServices) {
+            // Filter by category first
+            if (category !== "all") {
+                const serviceCategories = this.serviceCategories.get(service.id) || [];
+                if (!serviceCategories.includes(category)) {
+                    continue;
+                }
             }
 
-            const matches: any[] = [];
+            const serviceIdLower = service.id.toLowerCase();
+            const serviceTitleLower = service.title.toLowerCase();
+            const serviceDescLower = service.description.toLowerCase();
 
-            // Search across all services
-            for (const service of this.discoveredServices) {
-                // Filter by category first
-                if (category !== "all") {
-                    const serviceCategories = this.serviceCategories.get(service.id) || [];
-                    if (!serviceCategories.includes(category)) {
-                        continue;
+            // Service-level match with multi-word support
+            let serviceScore = 0;
+            if (query) {
+                if (this.matchesQuery(serviceIdLower, query, searchMode)) serviceScore = 0.9;
+                else if (this.matchesQuery(serviceTitleLower, query, searchMode)) serviceScore = 0.85;
+                else if (this.matchesQuery(serviceDescLower, query, searchMode)) serviceScore = 0.7;
+            }
+
+            if (serviceScore > 0 || !query) {
+                matches.push({
+                    type: "service",
+                    score: serviceScore || 0.5,
+                    service: {
+                        id: service.id,
+                        title: service.title,
+                        description: service.description,
+                        entityCount: service.metadata?.entityTypes?.length || 0,
+                        categories: this.serviceCategories.get(service.id) || []
+                    },
+                    matchReason: serviceScore > 0 ? `Service matches '${query}'` : `Service in category '${category}'`
+                });
+            }
+
+            // Entity-level matches within this service
+            if (service.metadata?.entityTypes && query) {
+                for (const entity of service.metadata.entityTypes) {
+                    const entityNameLower = entity.name.toLowerCase();
+                    let entityScore = 0;
+
+                    // Match entity name with multi-word support
+                    if (this.matchesQuery(entityNameLower, query, searchMode)) {
+                        entityScore = 0.95;
                     }
-                }
 
-                const serviceIdLower = service.id.toLowerCase();
-                const serviceTitleLower = service.title.toLowerCase();
-                const serviceDescLower = service.description.toLowerCase();
-
-                // Service-level match
-                let serviceScore = 0;
-                if (query) {
-                    if (serviceIdLower.includes(query)) serviceScore = 0.9;
-                    else if (serviceTitleLower.includes(query)) serviceScore = 0.85;
-                    else if (serviceDescLower.includes(query)) serviceScore = 0.7;
-                }
-
-                if (serviceScore > 0 || !query) {
-                    matches.push({
-                        type: "service",
-                        score: serviceScore || 0.5,
-                        service: {
-                            id: service.id,
-                            title: service.title,
-                            description: service.description,
-                            entityCount: service.metadata?.entityTypes?.length || 0,
-                            categories: this.serviceCategories.get(service.id) || []
-                        },
-                        matchReason: serviceScore > 0 ? `Service matches '${query}'` : `Service in category '${category}'`
-                    });
-                }
-
-                // Entity-level matches within this service
-                if (service.metadata?.entityTypes && query) {
-                    for (const entity of service.metadata.entityTypes) {
-                        const entityNameLower = entity.name.toLowerCase();
-                        let entityScore = 0;
-
-                        // Match entity name
-                        if (entityNameLower.includes(query)) {
-                            entityScore = 0.95;
+                    // Match property names with multi-word support
+                    let matchedProperties: string[] = [];
+                    for (const prop of entity.properties) {
+                        if (this.matchesQuery(prop.name.toLowerCase(), query, searchMode)) {
+                            matchedProperties.push(prop.name);
+                            if (entityScore === 0) entityScore = 0.75;
                         }
+                    }
 
-                        // Match property names
-                        let matchedProperties: string[] = [];
-                        for (const prop of entity.properties) {
-                            if (prop.name.toLowerCase().includes(query)) {
-                                matchedProperties.push(prop.name);
-                                if (entityScore === 0) entityScore = 0.75;
-                            }
-                        }
-
-                        if (entityScore > 0) {
-                            const match: any = {
-                                type: entityScore >= 0.9 ? "entity" : "property",
-                                score: entityScore,
-                                service: {
-                                    id: service.id,
-                                    title: service.title
+                    if (entityScore > 0) {
+                        const match: any = {
+                            type: entityScore >= 0.9 ? "entity" : "property",
+                            score: entityScore,
+                            service: {
+                                id: service.id,
+                                title: service.title
+                            },
+                            entity: {
+                                name: entity.name,
+                                entitySet: entity.entitySet,
+                                keyProperties: entity.keys,
+                                propertyCount: entity.properties.length,
+                                capabilities: {
+                                    readable: true,
+                                    creatable: entity.creatable,
+                                    updatable: entity.updatable,
+                                    deletable: entity.deletable
                                 },
-                                entity: {
-                                    name: entity.name,
-                                    entitySet: entity.entitySet,
-                                    keyProperties: entity.keys,
-                                    propertyCount: entity.properties.length,
-                                    capabilities: {
-                                        readable: true,
-                                        creatable: entity.creatable,
-                                        updatable: entity.updatable,
-                                        deletable: entity.deletable
-                                    }
-                                },
-                                matchReason: entityScore >= 0.9
-                                    ? `Entity '${entity.name}' matches '${query}'`
-                                    : `Properties [${matchedProperties.join(', ')}] match '${query}'`
-                            };
-
-                            // Include full schema if requested
-                            if (includeFullSchema) {
-                                match.entity.properties = entity.properties.map(prop => ({
+                                // Always include full schema for maximum efficiency
+                                properties: entity.properties.map(prop => ({
                                     name: prop.name,
                                     type: prop.type,
                                     nullable: prop.nullable,
                                     maxLength: prop.maxLength,
                                     isKey: entity.keys.includes(prop.name)
-                                }));
-                            } else {
-                                // Just include property names for summary
-                                match.entity.propertyNames = entity.properties.map(p => p.name);
-                                if (matchedProperties.length > 0) {
-                                    match.entity.matchedProperties = matchedProperties;
-                                }
-                            }
+                                }))
+                            },
+                            matchReason: entityScore >= 0.9
+                                ? `Entity '${entity.name}' matches '${query}'`
+                                : `Properties [${matchedProperties.join(', ')}] match '${query}'`
+                        };
 
-                            matches.push(match);
-                        }
+                        matches.push(match);
                     }
+                }
+            }
+        }
+
+        return matches;
+    }
+
+    /**
+     * Intelligent search across services, entities, and properties
+     * Always returns full schemas for maximum efficiency (avoids second requests)
+     * Multi-word query support with intelligent 3-level fallback:
+     * 1. Try combined words with requested category
+     * 2. If no results: try separated words with requested category
+     * 3. If still no results with specific category: try with 'all' categories
+     * 4. If still no results: try separated words with 'all' categories
+     */
+    private async searchServicesAndEntities(args: Record<string, unknown>) {
+        try {
+            const query = (args.query as string)?.toLowerCase() || "";
+            const requestedCategory = (args.category as string)?.toLowerCase() || "all";
+            const limit = (args.limit as number) || 10;
+
+            // Validate category
+            const validCategories = ["business-partner", "sales", "finance", "procurement", "hr", "logistics", "all"];
+            let category = validCategories.includes(requestedCategory) ? requestedCategory : "all";
+
+            let matches: any[] = [];
+            let searchMode: 'combined' | 'separated' = 'combined';
+            let usedCategoryFallback = false;
+            let usedSeparatedWords = false;
+
+            // Level 1: Try combined words with requested category
+            matches = this.performCategorySearch(query, category, 'combined');
+
+            // Level 2: If no results and multi-word query, try separated words with same category
+            if (matches.length === 0 && query && query.includes(' ')) {
+                this.logger.debug(`No results with combined query, trying separated words in category '${category}'`);
+                searchMode = 'separated';
+                usedSeparatedWords = true;
+                matches = this.performCategorySearch(query, category, 'separated');
+            }
+
+            // Level 3: If still no results with specific category, try with 'all'
+            if (matches.length === 0 && category !== "all" && query) {
+                this.logger.debug(`No results in category '${category}', retrying with 'all' categories`);
+                category = "all";
+                usedCategoryFallback = true;
+
+                // Try combined first
+                matches = this.performCategorySearch(query, category, 'combined');
+                searchMode = 'combined';
+                usedSeparatedWords = false;
+
+                // Level 4: If still no results and multi-word, try separated with 'all'
+                if (matches.length === 0 && query.includes(' ')) {
+                    this.logger.debug(`No results with combined query in 'all', trying separated words`);
+                    searchMode = 'separated';
+                    usedSeparatedWords = true;
+                    matches = this.performCategorySearch(query, category, 'separated');
                 }
             }
 
@@ -322,24 +384,33 @@ export class HierarchicalSAPToolRegistry {
 
             const result = {
                 query: query || "all",
-                category: category,
+                requestedCategory: requestedCategory,
+                actualCategory: category,
+                searchMode: searchMode,
+                usedCategoryFallback: usedCategoryFallback,
+                usedSeparatedWords: usedSeparatedWords,
                 totalFound: totalFound,
                 showing: limitedMatches.length,
-                detailLevel: includeFullSchema ? "full" : "summary",
+                detailLevel: "full",
                 matches: limitedMatches
             };
 
             let responseText = `Found ${totalFound} matches`;
             if (query) responseText += ` for "${query}"`;
-            if (category !== "all") responseText += ` in category "${category}"`;
+            if (requestedCategory !== "all") responseText += ` in category "${requestedCategory}"`;
+            if (usedCategoryFallback) responseText += ` (searched all categories)`;
+            if (usedSeparatedWords) responseText += ` (matched separated words)`;
             responseText += `:\n\n${JSON.stringify(result, null, 2)}`;
 
             if (limitedMatches.length > 0) {
-                responseText += `\n\n== NEXT STEPS ==`;
-                responseText += `\n1. To get full entity schema: Call discover-sap-data with serviceId and entityName`;
-                responseText += `\n2. To see all entities in a service: Call discover-sap-data with just serviceId`;
-                responseText += `\n3. To execute operations: Use execute-sap-operation with serviceId, entityName, and operation`;
-                responseText += `\n\nIMPORTANT: Use the 'id' field for serviceId and 'name' field for entityName`;
+                responseText += `\n\n== READY TO EXECUTE ==`;
+                responseText += `\n✓ COMPLETE SCHEMAS INCLUDED - All entity properties, types, keys, and capabilities are already in the results above`;
+                responseText += `\n✓ NO ADDITIONAL DISCOVERY NEEDED - Do NOT call discover-sap-data again`;
+                responseText += `\n✓ EXECUTE IMMEDIATELY - Use execute-sap-operation now with:`;
+                responseText += `\n  - serviceId: Use the 'id' field from service section above`;
+                responseText += `\n  - entityName: Use the 'name' field from entity section above`;
+                responseText += `\n  - operation: read, read-single, create, update, or delete`;
+                responseText += `\n  - parameters: Use the property names shown in the schema above`;
             } else {
                 responseText += `\n\n== SUGGESTION ==`;
                 responseText += `\nTry different search terms or categories: business-partner, sales, finance, procurement, hr, logistics, all`;
@@ -452,12 +523,12 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
-     * Discover entities within a service with capability information
+     * Discover entities within a service with full schemas
+     * Always returns complete property details for maximum efficiency
      */
     private async discoverServiceEntities(args: Record<string, unknown>) {
         try {
             const serviceId = args.serviceId as string;
-            const showCapabilities = args.showCapabilities !== false;
 
             const service = this.discoveredServices.find(s => s.id === serviceId);
             if (!service) {
@@ -473,7 +544,7 @@ export class HierarchicalSAPToolRegistry {
                     errorMessage += `SUGGESTION: Use 'discover-sap-data' to find available services.\n`;
                     errorMessage += `REMINDER: Make sure you're using the 'id' field from search results, NOT the 'title' field.`;
                 }
-                
+
                 return {
                     content: [{
                         type: "text" as const,
@@ -492,36 +563,27 @@ export class HierarchicalSAPToolRegistry {
                 };
             }
 
-            const entities = service.metadata.entityTypes.map(entity => {
-                const result: {
-                    name: string;
-                    entitySet: string | null | undefined;
-                    propertyCount: number;
-                    keyProperties: string[];
-                    capabilities?: {
-                        readable: boolean;
-                        creatable: boolean;
-                        updatable: boolean;
-                        deletable: boolean;
-                    };
-                } = {
-                    name: entity.name,
-                    entitySet: entity.entitySet,
-                    propertyCount: entity.properties.length,
-                    keyProperties: entity.keys
-                };
-
-                if (showCapabilities) {
-                    result.capabilities = {
-                        readable: true, // Always true for OData
-                        creatable: entity.creatable,
-                        updatable: entity.updatable,
-                        deletable: entity.deletable
-                    };
-                }
-
-                return result;
-            });
+            // Always include full schemas for maximum efficiency
+            const entities = service.metadata.entityTypes.map(entity => ({
+                name: entity.name,
+                entitySet: entity.entitySet,
+                keyProperties: entity.keys,
+                propertyCount: entity.properties.length,
+                capabilities: {
+                    readable: true, // Always true for OData
+                    creatable: entity.creatable,
+                    updatable: entity.updatable,
+                    deletable: entity.deletable
+                },
+                // Include full property schemas
+                properties: entity.properties.map(prop => ({
+                    name: prop.name,
+                    type: prop.type,
+                    nullable: prop.nullable,
+                    maxLength: prop.maxLength,
+                    isKey: entity.keys.includes(prop.name)
+                }))
+            }));
 
             const serviceInfo = {
                 service: {
@@ -531,18 +593,21 @@ export class HierarchicalSAPToolRegistry {
                     categories: this.serviceCategories.get(service.id) || [],
                     odataVersion: service.odataVersion
                 },
+                detailLevel: "full",
                 entities: entities
             };
 
             let responseText = `Service: ${service.title} (${serviceId})\n`;
-            responseText += `Found ${entities.length} entities\n\n`;
+            responseText += `Found ${entities.length} entities with full schemas\n\n`;
             responseText += JSON.stringify(serviceInfo, null, 2);
-            responseText += `\n\n== NEXT STEPS ==\n`;
-            responseText += `1. Call 'discover-sap-data' with serviceId and entityName to get full entity schema\n`;
-            responseText += `   - Set entityName to the 'name' field from above (NOT 'entitySet')\n`;
-            responseText += `2. Use 'execute-sap-operation' to perform CRUD operations on an entity\n`;
-            responseText += `   - Set entityName to the 'name' field from above (NOT 'entitySet')\n`;
-            responseText += `\nIMPORTANT: Always use the 'name' field for entityName, never use the 'entitySet' field`;
+            responseText += `\n\n== READY TO EXECUTE ==\n`;
+            responseText += `✓ COMPLETE SCHEMAS INCLUDED - All ${entities.length} entity schemas with properties, types, keys, and capabilities are already in the results above\n`;
+            responseText += `✓ NO ADDITIONAL DISCOVERY NEEDED - Do NOT call discover-sap-data again\n`;
+            responseText += `✓ EXECUTE IMMEDIATELY - Use execute-sap-operation now with:\n`;
+            responseText += `  - serviceId: "${serviceId}"\n`;
+            responseText += `  - entityName: Use the 'name' field from entity above (NOT 'entitySet')\n`;
+            responseText += `  - operation: read, read-single, create, update, or delete\n`;
+            responseText += `  - parameters: Use the property names shown in the schemas above`;
 
             return {
                 content: [{
@@ -631,11 +696,15 @@ export class HierarchicalSAPToolRegistry {
 
             let responseText = `Schema for ${entityName} in ${service.title}:\n\n`;
             responseText += JSON.stringify(schema, null, 2);
-            responseText += `\n\n== NEXT STEPS ==`;
-            responseText += `\n1. Use 'execute-sap-operation' tool to perform operations on this entity`;
-            responseText += `\n2. Refer to the keyProperties above when performing read-single, update, or delete operations`;
-            responseText += `\n3. Check the capabilities section to see which operations are allowed`;
-            responseText += `\n4. Use the properties list to understand what fields can be set for create/update operations`;
+            responseText += `\n\n== READY TO EXECUTE ==`;
+            responseText += `\n✓ COMPLETE SCHEMA INCLUDED - All properties, types, keys, and capabilities are already in the results above`;
+            responseText += `\n✓ NO ADDITIONAL DISCOVERY NEEDED - Do NOT call discover-sap-data again`;
+            responseText += `\n✓ EXECUTE IMMEDIATELY - Use execute-sap-operation now with:`;
+            responseText += `\n  - serviceId: "${serviceId}"`;
+            responseText += `\n  - entityName: "${entityName}"`;
+            responseText += `\n  - operation: read, read-single, create, update, or delete`;
+            responseText += `\n  - parameters: For operations, use keyProperties: [${entityType.keys.join(', ')}]`;
+            responseText += `\n  - Check capabilities above: creatable=${entityType.creatable}, updatable=${entityType.updatable}, deletable=${entityType.deletable}`;
 
             return {
                 content: [{
@@ -1066,19 +1135,24 @@ You have access to 2 intelligent tools:
 
 == RECOMMENDED WORKFLOW ==
 
-Simple Workflow (Most Common):
-1. discover-sap-data with query → Find what you need
-2. discover-sap-data with serviceId + entityName → Get full schema
-3. execute-sap-operation → Perform operation
+⚠️ CRITICAL: discover-sap-data ALWAYS returns COMPLETE schemas. NEVER call it twice for the same entity!
 
-Quick Workflow (Know What You Want):
-1. discover-sap-data with serviceId + entityName → Get full schema in one call
-2. execute-sap-operation → Perform operation
+Recommended Workflow:
+1. discover-sap-data with query → Returns FULL schemas immediately
+2. execute-sap-operation → Use the schema from step 1
 
-Search Workflow (Exploratory):
-1. discover-sap-data with query → See all matches with scores
-2. Refine with serviceId for entity list OR serviceId + entityName for schema
-3. execute-sap-operation → Perform operation
+⚠️ WRONG Workflow (DO NOT DO THIS):
+1. discover-sap-data with query → Get results
+2. discover-sap-data with serviceId + entityName → This is REDUNDANT! Step 1 already included FULL schemas!
+3. execute-sap-operation → You wasted a call in step 2!
+
+The discover-sap-data tool returns EVERYTHING you need in ONE call:
+- All properties with types
+- All key properties
+- All capabilities (creatable, updatable, deletable)
+- All constraints (nullable, maxLength)
+
+After calling discover-sap-data ONCE, proceed DIRECTLY to execute-sap-operation!
 
 == BEST PRACTICES ==
 
@@ -1105,27 +1179,22 @@ Natural Language Processing:
 == COMMON USER SCENARIOS ==
 
 "Show me customer data"
-1. discover-sap-data with query: "customer"
-2. See matches for Customer entity with relevance scores
-3. execute-sap-operation to read with filters
+1. discover-sap-data with query: "customer" → Returns FULL schemas with all properties
+2. execute-sap-operation to read with filters (use properties from step 1)
 
 "I need to update a customer's email"
-1. discover-sap-data with query: "customer email"
-→ Finds entities with both customer and email properties
-2. discover-sap-data with serviceId + entityName for full schema
-3. execute-sap-operation with operation: "update"
+1. discover-sap-data with query: "customer email" → Returns FULL entity schemas with email property
+2. execute-sap-operation with operation: "update" (all fields already known from step 1)
 
 "Create a new sales order"
-1. discover-sap-data with query: "sales order"
-2. discover-sap-data with serviceId + entityName for required fields
-3. Check capabilities (creatable: true)
-4. execute-sap-operation with operation: "create"
+1. discover-sap-data with query: "sales order" → Returns FULL schema with all required fields AND capabilities
+2. Check capabilities in the result (creatable: true already included)
+3. execute-sap-operation with operation: "create" (all required fields already in step 1 result)
 
 "Find all entities with 'Status' property"
-1. discover-sap-data with query: "status"
-→ Returns all entities across all services with Status property
-2. Pick relevant entity
-3. execute-sap-operation as needed
+1. discover-sap-data with query: "status" → Returns FULL schemas for all entities with Status property
+2. Pick relevant entity from step 1 results (which include complete schemas)
+3. execute-sap-operation as needed (using schema from step 1)
 
 == IMPORTANT REMINDERS ==
 
