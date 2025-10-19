@@ -68,7 +68,7 @@ export class HierarchicalSAPToolRegistry {
                 title: "Discover Service Entities",
                 description: "🔐 AUTHENTICATION AWARE: List all entities and their capabilities within a specific SAP service. Entity discovery uses technical user, but actual data access requires user authentication. Use this after finding a service to understand what data you can work with.",
                 inputSchema: {
-                    serviceId: z.string().describe("The SAP service ID to explore"),
+                    serviceId: z.string().describe("The SAP service ID from search-sap-services (use the 'id' field, NOT the 'title' field)"),
                     showCapabilities: z.boolean().default(true).describe("Show CRUD capabilities for each entity")
                 }
             },
@@ -84,8 +84,8 @@ export class HierarchicalSAPToolRegistry {
                 title: "Get Entity Schema",
                 description: "🔐 AUTHENTICATION AWARE: Get detailed schema information for a specific entity including properties, types, keys, and constraints. Schema access uses technical user, but data operations require user authentication.",
                 inputSchema: {
-                    serviceId: z.string().describe("The SAP service ID"),
-                    entityName: z.string().describe("The entity name")
+                    serviceId: z.string().describe("The SAP service ID from search-sap-services (use the 'id' field, NOT the 'title' field)"),
+                    entityName: z.string().describe("The entity name from discover-service-entities (use the 'name' field, NOT the 'entitySet' field)")
                 }
             },
             async (args: Record<string, unknown>) => {
@@ -100,8 +100,8 @@ export class HierarchicalSAPToolRegistry {
                 title: "Execute Entity Operation",
                 description: "🔒 AUTHENTICATION REQUIRED: Perform CRUD operations on SAP entities using authenticated user context. This tool requires valid JWT token for authorization and audit trail. Use discover-service-entities first to understand available entities and their schemas. Operations execute under user's SAP identity.",
                 inputSchema: {
-                    serviceId: z.string().describe("The SAP service ID"),
-                    entityName: z.string().describe("The entity name within the service"),
+                    serviceId: z.string().describe("The SAP service ID from search-sap-services (use the 'id' field, NOT the 'title' field)"),
+                    entityName: z.string().describe("The entity name from discover-service-entities (use the 'name' field, NOT the 'entitySet' field)"),
                     operation: z.enum(["read", "read-single", "create", "update", "delete"]).describe("The operation to perform"),
                     parameters: z.record(z.any()).optional().describe("Operation parameters (keys, filters, data, etc.)"),
                     queryOptions: z.object({
@@ -234,7 +234,8 @@ export class HierarchicalSAPToolRegistry {
             responseText += `:\n\n${JSON.stringify(result, null, 2)}`;
 
             if (result.services.length > 0) {
-                responseText += `\n\n📋 Next step: Use 'discover-service-entities' with a serviceId to see what entities are available in a specific service.`;
+                responseText += `\n\n📋 Next step: Use 'discover-service-entities' with the serviceId parameter set to the 'id' field (NOT the 'title' field) from the results above.`;
+                responseText += `\n\n⚠️  IMPORTANT: Always use the 'id' field as serviceId, never use the 'title' field!`;
             } else {
                 responseText += `\n\n💡 Try different search terms or categories: business-partner, sales, finance, procurement, hr, logistics`;
             }
@@ -268,10 +269,23 @@ export class HierarchicalSAPToolRegistry {
 
             const service = this.discoveredServices.find(s => s.id === serviceId);
             if (!service) {
+                // Check if user provided a title instead of an id
+                const serviceByTitle = this.discoveredServices.find(s => s.title.toLowerCase() === serviceId.toLowerCase());
+                let errorMessage = `❌ Service not found: ${serviceId}\n\n`;
+                
+                if (serviceByTitle) {
+                    errorMessage += `⚠️  It looks like you used the 'title' field instead of the 'id' field!\n`;
+                    errorMessage += `✅ Use this serviceId instead: ${serviceByTitle.id}\n\n`;
+                    errorMessage += `Remember: Always use the 'id' field from search-sap-services results, NOT the 'title' field.`;
+                } else {
+                    errorMessage += `💡 Use 'search-sap-services' to find available services.\n`;
+                    errorMessage += `⚠️  Make sure you're using the 'id' field from search results, NOT the 'title' field.`;
+                }
+                
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `❌ Service not found: ${serviceId}\n\n💡 Use 'search-sap-services' to find available services.`
+                        text: errorMessage
                     }],
                     isError: true
                 };
@@ -332,8 +346,9 @@ export class HierarchicalSAPToolRegistry {
             responseText += `📁 Found ${entities.length} entities\n\n`;
             responseText += JSON.stringify(serviceInfo, null, 2);
             responseText += `\n\n📋 Next steps:\n`;
-            responseText += `• Use 'get-entity-schema' to see detailed property information for an entity\n`;
-            responseText += `• Use 'execute-entity-operation' to perform CRUD operations`;
+            responseText += `• Use 'get-entity-schema' with entityName set to the 'name' field (NOT 'entitySet') to see detailed property information\n`;
+            responseText += `• Use 'execute-entity-operation' with entityName set to the 'name' field (NOT 'entitySet') to perform CRUD operations\n`;
+            responseText += `\n⚠️  IMPORTANT: Always use the 'name' field for entityName, never use the 'entitySet' field!`;
 
             return {
                 content: [{
@@ -364,10 +379,23 @@ export class HierarchicalSAPToolRegistry {
 
             const service = this.discoveredServices.find(s => s.id === serviceId);
             if (!service) {
+                // Check if user provided a title instead of an id
+                const serviceByTitle = this.discoveredServices.find(s => s.title.toLowerCase() === serviceId.toLowerCase());
+                let errorMessage = `❌ Service not found: ${serviceId}\n\n`;
+                
+                if (serviceByTitle) {
+                    errorMessage += `⚠️  It looks like you used the 'title' field instead of the 'id' field!\n`;
+                    errorMessage += `✅ Use this serviceId instead: ${serviceByTitle.id}\n\n`;
+                    errorMessage += `Remember: Always use the 'id' field from search-sap-services results, NOT the 'title' field.`;
+                } else {
+                    errorMessage += `💡 Use 'search-sap-services' to find available services.\n`;
+                    errorMessage += `⚠️  Make sure you're using the 'id' field from search results, NOT the 'title' field.`;
+                }
+                
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `❌ Service not found: ${serviceId}`
+                        text: errorMessage
                     }],
                     isError: true
                 };
@@ -445,10 +473,23 @@ export class HierarchicalSAPToolRegistry {
             // Validate service
             const service = this.discoveredServices.find(s => s.id === serviceId);
             if (!service) {
+                // Check if user provided a title instead of an id
+                const serviceByTitle = this.discoveredServices.find(s => s.title.toLowerCase() === serviceId.toLowerCase());
+                let errorMessage = `❌ Service not found: ${serviceId}\n\n`;
+                
+                if (serviceByTitle) {
+                    errorMessage += `⚠️  It looks like you used the 'title' field instead of the 'id' field!\n`;
+                    errorMessage += `✅ Use this serviceId instead: ${serviceByTitle.id}\n\n`;
+                    errorMessage += `Remember: Always use the 'id' field from search-sap-services results, NOT the 'title' field.`;
+                } else {
+                    errorMessage += `💡 Use 'search-sap-services' to find available services.\n`;
+                    errorMessage += `⚠️  Make sure you're using the 'id' field from search results, NOT the 'title' field.`;
+                }
+                
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `❌ Service not found: ${serviceId}`
+                        text: errorMessage
                     }],
                     isError: true
                 };
