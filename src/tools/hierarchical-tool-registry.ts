@@ -44,16 +44,16 @@ export class HierarchicalSAPToolRegistry {
     public async registerDiscoveryTools(): Promise<void> {
         this.logger.info(`🔧 Registering intelligent discovery tools for ${this.discoveredServices.length} services`);
 
-        // Tool 1: Intelligent universal discovery - SIMPLIFIED to query-only interface
+        // Tool 1: Intelligent universal discovery - Returns mapping table for easy LLM consumption
         this.mcpServer.registerTool(
             "discover-sap-data",
             {
                 title: "Discover SAP Data",
-                description: "[SINGLE-USE DISCOVERY TOOL] Call this tool ONCE and you will receive EVERYTHING you need. Returns COMPLETE entity schemas with ALL properties, types, keys, and capabilities in ONE response. WARNING: NEVER call this tool multiple times with different queries - the first call gives you full information. After receiving results, proceed IMMEDIATELY to execute-sap-operation. DO NOT try variations like searching for service IDs, entity names, or refined queries - you already have complete data. Discovery uses technical user (no auth needed), but execute operations require user authentication.",
+                description: "[SINGLE-USE DISCOVERY TOOL] Call this tool ONCE and you will receive EVERYTHING you need as a MAPPING TABLE. Returns a flat table with columns: Service ID, Service Name, Entity Name, Property Name, Property Type, Is Key, Capabilities. This table format is optimized for LLM consumption - easy to scan and find the right API. WARNING: NEVER call this tool multiple times with different queries - the first call gives you full information. After receiving the mapping table, proceed IMMEDIATELY to execute-sap-operation. DO NOT try variations like searching for service IDs, entity names, or refined queries - you already have complete data. Discovery uses technical user (no auth needed), but execute operations require user authentication.",
                 inputSchema: {
-                    query: z.string().optional().describe("Search term to find services, entities, or properties. Searches across service names, entity names, and property names. Examples: 'customer', 'email', 'sales order'. If omitted, returns ALL available services and entities. Returns FULL entity schemas with ALL property details in ONE call - you will have EVERYTHING you need after this single call."),
+                    query: z.string().optional().describe("Search term to find services, entities, or properties. Searches across service names, entity names, and property names. Examples: 'customer', 'email', 'sales order'. If omitted, returns ALL available services and entities. Returns a MAPPING TABLE with ALL entities and properties in ONE call - you will have EVERYTHING you need after this single call."),
                     category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search results to specific business area. If no results found with specified category, automatically retries with 'all' categories in the same request."),
-                    limit: z.number().min(1).max(20).optional().describe("Maximum number of results to return. Default: 10. Use this to control result set size.")
+                    limit: z.number().min(1).max(20).optional().describe("Maximum number of services/entities to return. Default: 10. Use this to control result set size. Note: This limits the number of matched services/entities, but each entity will include ALL its properties in the mapping table.")
                 }
             },
             async (args: Record<string, unknown>) => {
@@ -320,7 +320,7 @@ export class HierarchicalSAPToolRegistry {
 
     /**
      * Intelligent search across services, entities, and properties
-     * Always returns full schemas for maximum efficiency (avoids second requests)
+     * Returns a flat mapping table for easy LLM consumption
      * Multi-word query support with intelligent 3-level fallback:
      * 1. Try combined words with requested category
      * 2. If no results: try separated words with requested category
@@ -386,9 +386,12 @@ export class HierarchicalSAPToolRegistry {
             // Sort by relevance score
             matches.sort((a, b) => b.score - a.score);
 
-            // Apply limit
+            // Apply limit to matches before converting to mapping table
             const totalFound = matches.length;
             const limitedMatches = matches.slice(0, limit);
+
+            // Convert matches to flat mapping table
+            const mappingTable = this.convertToMappingTable(limitedMatches);
 
             const result = {
                 query: query || "all",
@@ -399,37 +402,52 @@ export class HierarchicalSAPToolRegistry {
                 usedSeparatedWords: usedSeparatedWords,
                 returnedAllServices: returnedAllServices,
                 totalFound: totalFound,
+                totalProperties: mappingTable.length,
                 showing: limitedMatches.length,
-                detailLevel: "full",
-                matches: limitedMatches
+                mappingTable: mappingTable
             };
 
             // Build response with GUIDANCE FIRST, then data
             let responseText = "";
 
-            if (limitedMatches.length > 0) {
+            if (mappingTable.length > 0) {
                 responseText += `*** DISCOVERY COMPLETE - YOU HAVE EVERYTHING YOU NEED! ***\n\n`;
-                responseText += `[COMPLETE] This response contains COMPLETE entity schemas with ALL properties, types, keys, and capabilities\n`;
+                responseText += `[COMPLETE] This response contains a MAPPING TABLE with service IDs, entity names, and properties\n`;
                 responseText += `[STOP] NO additional discovery needed - Do NOT call discover-sap-data again\n`;
                 responseText += `[NEXT] Use execute-sap-operation immediately with the data below\n\n`;
                 if (returnedAllServices) {
-                    responseText += `NOTICE: No matches found for "${query}", so returning ALL available services with full schemas\n\n`;
+                    responseText += `NOTICE: No matches found for "${query}", so returning ALL available services\n\n`;
                 }
-                responseText += `SUMMARY: Found ${totalFound} matches`;
+                responseText += `SUMMARY: Found ${totalFound} matching services/entities`;
                 if (query && !returnedAllServices) responseText += ` for "${query}"`;
                 if (requestedCategory !== "all") responseText += ` in category "${requestedCategory}"`;
                 if (usedCategoryFallback && !returnedAllServices) responseText += ` (searched all categories)`;
                 if (usedSeparatedWords) responseText += ` (matched separated words)`;
-                responseText += `, showing ${limitedMatches.length}\n\n`;
+                responseText += `, showing ${limitedMatches.length} with ${mappingTable.length} total properties\n\n`;
+
+                // Show example of how to use the first result
+                const firstRow = mappingTable[0];
                 responseText += `EXECUTE WITH THESE VALUES:\n`;
-                responseText += `  serviceId: "${limitedMatches[0].service.id}" (from 'service.id' in results)\n`;
-                if (limitedMatches[0].type === 'entity' || limitedMatches[0].type === 'property') {
-                    responseText += `  entityName: "${limitedMatches[0].entity.name}" (from 'entity.name' in results)\n`;
-                }
-                responseText += `  operation: read | read-single | create | update | delete\n\n`;
+                responseText += `  serviceId: "${firstRow.serviceId}"\n`;
+                responseText += `  entityName: "${firstRow.entityName}"\n`;
+                responseText += `  operation: read | read-single | create | update | delete\n`;
+                responseText += `  Available operations: ${firstRow.capabilities}\n\n`;
+
                 responseText += `================================================\n`;
-                responseText += `FULL DATA (complete schemas with all details):\n`;
+                responseText += `MAPPING TABLE (scan this to find the right API):\n`;
                 responseText += `================================================\n\n`;
+                responseText += this.formatMappingTableAsText(mappingTable);
+                responseText += `\n\n`;
+                responseText += `== HOW TO USE THIS TABLE ==\n`;
+                responseText += `1. Find the entity you need by scanning the "Entity Name" column\n`;
+                responseText += `2. Check the properties available in that entity\n`;
+                responseText += `3. Note the "Service ID" for that row\n`;
+                responseText += `4. Use execute-sap-operation with:\n`;
+                responseText += `   - serviceId: from "Service ID" column\n`;
+                responseText += `   - entityName: from "Entity Name" column\n`;
+                responseText += `   - operation: check "Capabilities" to see what's allowed\n`;
+                responseText += `   - parameters: use property names from "Property Name" column\n\n`;
+                responseText += `== FULL JSON DATA ==\n`;
                 responseText += JSON.stringify(result, null, 2);
             } else {
                 responseText += `No matches found`;
@@ -456,6 +474,113 @@ export class HierarchicalSAPToolRegistry {
                 isError: true
             };
         }
+    }
+
+    /**
+     * Convert matches to a flat mapping table
+     * Each row represents one property in an entity
+     */
+    private convertToMappingTable(matches: any[]): any[] {
+        const mappingTable: any[] = [];
+
+        for (const match of matches) {
+            // Handle service-level matches (includes entities)
+            if (match.type === 'service' && match.entities) {
+                for (const entity of match.entities) {
+                    const capabilities = `R:${entity.capabilities.readable ? 'Y' : 'N'} C:${entity.capabilities.creatable ? 'Y' : 'N'} U:${entity.capabilities.updatable ? 'Y' : 'N'} D:${entity.capabilities.deletable ? 'Y' : 'N'}`;
+
+                    for (const prop of entity.properties) {
+                        mappingTable.push({
+                            serviceId: match.service.id,
+                            serviceName: match.service.title,
+                            entityName: entity.name,
+                            entitySet: entity.entitySet,
+                            propertyName: prop.name,
+                            propertyType: prop.type,
+                            isKey: prop.isKey,
+                            nullable: prop.nullable,
+                            maxLength: prop.maxLength || 'N/A',
+                            capabilities: capabilities
+                        });
+                    }
+                }
+            }
+            // Handle entity-level matches
+            else if ((match.type === 'entity' || match.type === 'property') && match.entity) {
+                const entity = match.entity;
+                const capabilities = `R:${entity.capabilities.readable ? 'Y' : 'N'} C:${entity.capabilities.creatable ? 'Y' : 'N'} U:${entity.capabilities.updatable ? 'Y' : 'N'} D:${entity.capabilities.deletable ? 'Y' : 'N'}`;
+
+                for (const prop of entity.properties) {
+                    mappingTable.push({
+                        serviceId: match.service.id,
+                        serviceName: match.service.title,
+                        entityName: entity.name,
+                        entitySet: entity.entitySet,
+                        propertyName: prop.name,
+                        propertyType: prop.type,
+                        isKey: prop.isKey,
+                        nullable: prop.nullable,
+                        maxLength: prop.maxLength || 'N/A',
+                        capabilities: capabilities
+                    });
+                }
+            }
+        }
+
+        return mappingTable;
+    }
+
+    /**
+     * Format mapping table as readable text table
+     */
+    private formatMappingTableAsText(mappingTable: any[]): string {
+        if (mappingTable.length === 0) return "No data";
+
+        let output = "";
+
+        // Group by service and entity for better readability
+        const grouped = new Map<string, Map<string, any[]>>();
+
+        for (const row of mappingTable) {
+            const serviceKey = `${row.serviceId} (${row.serviceName})`;
+            if (!grouped.has(serviceKey)) {
+                grouped.set(serviceKey, new Map());
+            }
+
+            const serviceGroup = grouped.get(serviceKey)!;
+            if (!serviceGroup.has(row.entityName)) {
+                serviceGroup.set(row.entityName, []);
+            }
+
+            serviceGroup.get(row.entityName)!.push(row);
+        }
+
+        // Format output
+        for (const [serviceKey, entities] of grouped) {
+            output += `SERVICE: ${serviceKey}\n`;
+            output += `${'='.repeat(80)}\n\n`;
+
+            for (const [entityName, properties] of entities) {
+                const firstProp = properties[0];
+                output += `  ENTITY: ${entityName}\n`;
+                output += `  Entity Set: ${firstProp.entitySet}\n`;
+                output += `  Capabilities: ${firstProp.capabilities}\n`;
+                output += `  Properties:\n`;
+                output += `  ${'─'.repeat(76)}\n`;
+                output += `  ${'Property Name'.padEnd(30)} ${'Type'.padEnd(20)} ${'Key'.padEnd(5)} ${'Nullable'.padEnd(10)} ${'MaxLen'}\n`;
+                output += `  ${'─'.repeat(76)}\n`;
+
+                for (const prop of properties) {
+                    output += `  ${prop.propertyName.padEnd(30)} ${prop.propertyType.padEnd(20)} ${(prop.isKey ? 'YES' : 'NO').padEnd(5)} ${(prop.nullable ? 'YES' : 'NO').padEnd(10)} ${prop.maxLength}\n`;
+                }
+
+                output += `\n`;
+            }
+
+            output += `\n`;
+        }
+
+        return output;
     }
 
     /**
@@ -1137,19 +1262,20 @@ Authentication Requirements:
 
 You have access to 2 intelligent tools:
 
-1. discover-sap-data (UNIVERSAL SEARCH - COMPLETE RESULTS IN ONE CALL)
+1. discover-sap-data (UNIVERSAL SEARCH - MAPPING TABLE IN ONE CALL)
 - Purpose: Single tool for ALL discovery - services, entities, AND properties
-- Returns: COMPLETE schemas with ALL property details in ONE call
+- Returns: FLAT MAPPING TABLE with all entities and properties in ONE call
+- Table Format: Each row contains Service ID, Service Name, Entity Name, Property Name, Property Type, Is Key, Capabilities
 - Parameters:
   - query (REQUIRED): Search across services, entities, properties
   - category (optional): Filter by business area (business-partner, sales, finance, etc.)
-  - limit (optional): Maximum results to return (default: 10)
+  - limit (optional): Maximum services/entities to return (default: 10)
 - Examples:
-  - { query: "customer" } → Returns FULL customer entity schemas
-  - { query: "email" } → Returns all entities with email properties
-  - { query: "sales order", category: "sales" } → Returns sales order entities with FULL schemas
+  - { query: "customer" } → Returns mapping table with ALL customer entity properties
+  - { query: "email" } → Returns mapping table with all entities that have email properties
+  - { query: "sales order", category: "sales" } → Returns mapping table for sales order entities
 - ⚠️ CRITICAL: Returns EVERYTHING in ONE call - DO NOT call again with serviceId/entityName
-- This ONE tool call gives you ALL the information you need
+- This ONE tool call gives you ALL the information you need in an easy-to-scan table format
 
 2. execute-sap-operation
 - Purpose: Perform CRUD operations on entities
@@ -1160,24 +1286,28 @@ You have access to 2 intelligent tools:
 
 == RECOMMENDED WORKFLOW ==
 
-⚠️ CRITICAL: discover-sap-data ALWAYS returns COMPLETE schemas. NEVER call it twice for the same entity!
+⚠️ CRITICAL: discover-sap-data ALWAYS returns a COMPLETE MAPPING TABLE. NEVER call it twice for the same entity!
 
 Recommended Workflow:
-1. discover-sap-data with query → Returns FULL schemas immediately
-2. execute-sap-operation → Use the schema from step 1
+1. discover-sap-data with query → Returns FLAT MAPPING TABLE immediately with ALL data
+2. Scan the mapping table to find the right entity and properties
+3. execute-sap-operation → Use serviceId and entityName from the mapping table
 
 ⚠️ WRONG Workflow (DO NOT DO THIS):
-1. discover-sap-data with query → Get results
-2. discover-sap-data with serviceId + entityName → This is REDUNDANT! Step 1 already included FULL schemas!
+1. discover-sap-data with query → Get mapping table
+2. discover-sap-data with serviceId + entityName → This is REDUNDANT! Step 1 already included ALL properties!
 3. execute-sap-operation → You wasted a call in step 2!
 
-The discover-sap-data tool returns EVERYTHING you need in ONE call:
-- All properties with types
-- All key properties
-- All capabilities (creatable, updatable, deletable)
-- All constraints (nullable, maxLength)
+The discover-sap-data tool returns EVERYTHING you need in ONE MAPPING TABLE:
+- Service IDs (for execute-sap-operation)
+- Service Names (human-readable)
+- Entity Names (for execute-sap-operation)
+- ALL properties with types
+- Key properties (marked in "Is Key" column)
+- Capabilities (R:Y/N C:Y/N U:Y/N D:Y/N format)
+- Property constraints (nullable, maxLength)
 
-After calling discover-sap-data ONCE, proceed DIRECTLY to execute-sap-operation!
+After calling discover-sap-data ONCE, scan the mapping table and proceed DIRECTLY to execute-sap-operation!
 
 == BEST PRACTICES ==
 
@@ -1204,22 +1334,26 @@ Natural Language Processing:
 == COMMON USER SCENARIOS ==
 
 "Show me customer data"
-1. discover-sap-data with query: "customer" → Returns FULL schemas with all properties
-2. execute-sap-operation to read with filters (use properties from step 1)
+1. discover-sap-data with query: "customer" → Returns MAPPING TABLE with all customer entities and properties
+2. Scan the table to find the right customer entity
+3. execute-sap-operation to read with serviceId and entityName from the table
 
 "I need to update a customer's email"
-1. discover-sap-data with query: "customer email" → Returns FULL entity schemas with email property
-2. execute-sap-operation with operation: "update" (all fields already known from step 1)
+1. discover-sap-data with query: "customer email" → Returns MAPPING TABLE showing entities with email property
+2. Scan the table to find customer entity with email property
+3. execute-sap-operation with operation: "update" using serviceId, entityName, and email property from table
 
 "Create a new sales order"
-1. discover-sap-data with query: "sales order" → Returns FULL schema with all required fields AND capabilities
-2. Check capabilities in the result (creatable: true already included)
-3. execute-sap-operation with operation: "create" (all required fields already in step 1 result)
+1. discover-sap-data with query: "sales order" → Returns MAPPING TABLE with all sales order properties
+2. Scan the table's Capabilities column to confirm creatable (C:Y)
+3. Review all required properties in the mapping table
+4. execute-sap-operation with operation: "create" using serviceId, entityName, and properties from table
 
 "Find all entities with 'Status' property"
-1. discover-sap-data with query: "status" → Returns FULL schemas for all entities with Status property
-2. Pick relevant entity from step 1 results (which include complete schemas)
-3. execute-sap-operation as needed (using schema from step 1)
+1. discover-sap-data with query: "status" → Returns MAPPING TABLE with all entities that have Status property
+2. Scan the table to see all entities with Status property
+3. Pick relevant entity from the table (serviceId and entityName are right there)
+4. execute-sap-operation as needed using values from the table
 
 == IMPORTANT REMINDERS ==
 
