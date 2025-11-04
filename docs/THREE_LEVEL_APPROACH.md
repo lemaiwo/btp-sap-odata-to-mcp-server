@@ -338,6 +338,52 @@ discover-sap-data → get-entity-metadata → execute-sap-operation
 
 ---
 
+## Known Limitations & Workarounds
+
+### $select Support Issues
+
+⚠️ **Issue**: Not all SAP OData APIs fully support the `$select` query option.
+
+**Symptoms**:
+- Errors mentioning "select", "projection", "invalid property", "property not found"
+- API returns 400 or 500 errors when using selectString parameter
+- Some properties appear as "not found" even though they exist in metadata
+
+**Automatic Detection**:
+The error handler automatically detects potential $select-related errors and provides intelligent retry instructions.
+
+**Example Error Response**:
+```
+⚠️ DETECTED: This error might be related to $select not being fully supported by this SAP API.
+
+🔄 RETRY STRATEGY:
+Many SAP OData APIs have incomplete $select support. Please retry the SAME operation with these changes:
+
+1. Remove the selectString parameter (or set it to empty string)
+2. Keep all other parameters the same:
+   - serviceId: "API_BUSINESS_PARTNER"
+   - entityName: "Customer"
+   - operation: "read"
+   - filterString: "CustomerName eq 'ACME'"
+3. DO NOT include selectString parameter
+
+This will return ALL properties instead of a subset, which works with all SAP APIs.
+```
+
+**Best Practice**:
+- Always be prepared to retry without `selectString` if the first attempt fails
+- The error response contains exact parameters to use for retry
+- Use `filterString` and `topNumber` to limit data instead of `selectString`
+
+**Supported Alternative**:
+- ✅ `filterString` - Widely supported, use to filter rows
+- ✅ `topNumber` - Widely supported, use to limit result count
+- ✅ `orderbyString` - Generally supported for sorting
+- ⚠️ `selectString` - Limited support, use with caution
+- ⚠️ `expandString` - Limited support, check API documentation
+
+---
+
 ## API Design Principles
 
 ### 1. Progressive Disclosure

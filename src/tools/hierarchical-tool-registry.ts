@@ -97,7 +97,7 @@ export class HierarchicalSAPToolRegistry {
                     operation: z.string().describe("The operation to perform. Valid values: read, read-single, create, update, delete"),
                     parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete operations, include the entity key properties. For create/update operations, include the entity data fields."),
                     filterString: z.string().optional().describe("OData $filter query option value. Use OData filter syntax without the '$filter=' prefix. Examples: \"Status eq 'Active'\", \"Amount gt 1000\", \"Name eq 'John' and Status eq 'Active'\". Common operators: eq (equals), ne (not equals), gt (greater than), lt (less than), ge (greater/equal), le (less/equal), and, or, not."),
-                    selectString: z.string().optional().describe("OData $select query option value. Comma-separated list of property names to include in the response, without the '$select=' prefix. Example: \"Name,Status,CreatedDate\" or \"CustomerID,CustomerName\"."),
+                    selectString: z.string().optional().describe("OData $select query option value. Comma-separated list of property names to include in the response, without the '$select=' prefix. Example: \"Name,Status,CreatedDate\" or \"CustomerID,CustomerName\". WARNING: Not all SAP OData APIs fully support $select. If the operation fails with a $select-related error, retry WITHOUT this parameter to get all properties."),
                     expandString: z.string().optional().describe("OData $expand query option value. Comma-separated list of navigation properties to expand, without the '$expand=' prefix. Example: \"Customer,Items\" or \"OrderDetails\"."),
                     orderbyString: z.string().optional().describe("OData $orderby query option value. Specify property name and direction (asc/desc), without the '$orderby=' prefix. Examples: \"Name desc\", \"CreatedDate asc\", \"Amount desc, Name asc\"."),
                     topNumber: z.number().optional().describe("OData $top query option value. Number of records to return (limit/page size). This will be converted to the $top parameter. Example: 10 returns top 10 records."),
@@ -1197,10 +1197,53 @@ export class HierarchicalSAPToolRegistry {
 
         } catch (error) {
             this.logger.error('Error executing entity operation:', error);
+
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            const hasSelectString = args.selectString && (args.selectString as string).trim().length > 0;
+
+            // Check if error might be related to $select not being supported
+            const selectRelatedErrors = [
+                'select',
+                '$select',
+                'projection',
+                'column',
+                'field',
+                'property not found',
+                'invalid property',
+                'unknown property'
+            ];
+
+            const mightBeSelectError = hasSelectString &&
+                selectRelatedErrors.some(term => errorMessage.toLowerCase().includes(term));
+
+            let responseText = `ERROR: Failed to execute ${args.operation} operation on ${args.entityName}\n\n`;
+            responseText += `Error Details: ${errorMessage}\n\n`;
+
+            if (mightBeSelectError) {
+                responseText += `⚠️ DETECTED: This error might be related to $select not being fully supported by this SAP API.\n\n`;
+                responseText += `🔄 RETRY STRATEGY:\n`;
+                responseText += `Many SAP OData APIs have incomplete $select support. Please retry the SAME operation with these changes:\n\n`;
+                responseText += `1. Remove the selectString parameter (or set it to empty string)\n`;
+                responseText += `2. Keep all other parameters the same:\n`;
+                responseText += `   - serviceId: "${args.serviceId}"\n`;
+                responseText += `   - entityName: "${args.entityName}"\n`;
+                responseText += `   - operation: "${args.operation}"\n`;
+                if (args.filterString) responseText += `   - filterString: "${args.filterString}"\n`;
+                if (args.topNumber) responseText += `   - topNumber: ${args.topNumber}\n`;
+                if (args.skipNumber) responseText += `   - skipNumber: ${args.skipNumber}\n`;
+                if (args.orderbyString) responseText += `   - orderbyString: "${args.orderbyString}"\n`;
+                if (args.expandString) responseText += `   - expandString: "${args.expandString}"\n`;
+                responseText += `3. DO NOT include selectString parameter\n\n`;
+                responseText += `This will return ALL properties instead of a subset, which works with all SAP APIs.\n`;
+            } else if (hasSelectString) {
+                responseText += `💡 TIP: If this error persists, try removing the selectString parameter.\n`;
+                responseText += `Some SAP OData APIs don't fully support $select. Retry without selectString to get all properties.\n`;
+            }
+
             return {
                 content: [{
                     type: "text" as const,
-                    text: `ERROR: Failed to execute ${args.operation} operation on ${args.entityName}: ${error instanceof Error ? error.message : String(error)}`
+                    text: responseText
                 }],
                 isError: true
             };
@@ -1490,14 +1533,20 @@ Authentication Guidance:
 - Explain that discovery uses technical user, operations use their credentials
 
 Query Optimization:
-- Use OData query options (filterString, selectString, topNumber) to limit data
+- Use OData query options (filterString, topNumber) to limit data
 - Encourage filtering to avoid large result sets
 - Show users how to construct proper OData filters
+- IMPORTANT: selectString ($select) is NOT fully supported by all SAP OData APIs
+  * If operation fails with $select-related error, retry WITHOUT selectString
+  * The error handler will detect this and provide automatic retry instructions
+  * Some SAP APIs silently ignore $select, others return errors
 
 Error Handling:
 - If entity not found, suggest using discovery tools first
 - For permission errors, explain JWT token requirements
 - Guide users to check entity capabilities before operations
+- For $select errors: Automatically instruct to retry without selectString parameter
+- Follow retry instructions in error messages - they contain exact parameters to use
 
 Natural Language Processing:
 - Translate user requests into appropriate tool calls
