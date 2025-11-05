@@ -20,6 +20,41 @@ SAP_DESTINATION_NAME=MY_DESTINATION
 
 You can also set any service discovery environment variables described in the main documentation.
 
+## Run Locally Without BTP (env destinations)
+
+You can run fully locally without BTP Destination/Connectivity by providing a destination via environment variables. Your machine must be able to reach the SAP host/port directly (VPN as needed); Cloud Connector is not used in this mode.
+
+### Option A: .env (recommended)
+```env
+SAP_DESTINATION_NAME=S4
+destinations=[{"name":"S4","url":"https://<URL>:<PORT>","username":"<USER>","password":"<PASSWORD>"}]
+# If your system uses self-signed TLS certificates (local only):
+# NODE_TLS_REJECT_UNAUTHORIZED=0
+# Optional logging:
+# LOG_LEVEL=debug
+```
+
+### Option B: one-off in your shell
+```bash
+export SAP_DESTINATION_NAME=S4
+export destinations='[{"name":"S4","url":"https://<host>:<port>","username":"<user>","password":"<pass>"}]'
+# If needed for self-signed TLS:
+# export NODE_TLS_REJECT_UNAUTHORIZED=0
+```
+
+Notes:
+- The default destination name is `SAP_SYSTEM`. Either set `SAP_DESTINATION_NAME` or make the JSON `name` match `SAP_SYSTEM`.
+- The server accepts `destinations` or `DESTINATIONS`. If exactly one destination is provided, it will be used automatically.
+- If XSUAA is not configured in VCAP (local), OAuth is disabled and the server runs without a token requirement.
+
+Verify after start:
+- Health: `http://localhost:3000/health`
+- MCP info: `http://localhost:3000/mcp`
+
+Troubleshooting:
+- If you see messages about missing destination service bindings, ensure `destinations`/`DESTINATIONS` is set in your environment or `.env`.
+```
+
 ## Running the Server
 
 After configuration, start the server with:

@@ -305,6 +305,31 @@ GET /docs
 }
 ```
 
+## 🧪 Quick Local Test (No BTP)
+
+Run the server locally without deploying to BTP by providing a destination via environment variables (uses Basic Authentication). Your machine must be able to reach the SAP host/port directly.
+
+1) Create a `.env` file in the project root:
+
+```env
+SAP_DESTINATION_NAME=S4
+destinations=[{"name":"S4","url":"https://<HOST>:<PORT>","username":"<USER>","password":"<PASSWORD>"}]
+# If your system uses self-signed TLS (local-only):
+# NODE_TLS_REJECT_UNAUTHORIZED=0
+```
+
+2) Start the server:
+
+```bash
+npm run start:http
+```
+
+3) Verify:
+- Health: `http://localhost:3000/health`
+- MCP info: `http://localhost:3000/mcp`
+
+See more details and troubleshooting in [LOCAL_RUN.md](./docs/LOCAL_RUN.md).
+
 ## 🎬 Demo
 
 See the MCP server in action:
