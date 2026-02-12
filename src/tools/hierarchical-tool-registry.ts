@@ -1216,8 +1216,26 @@ export class HierarchicalSAPToolRegistry {
             const mightBeSelectError = hasSelectString &&
                 selectRelatedErrors.some(term => errorMessage.toLowerCase().includes(term));
 
+            // Extract HTTP response (Axios-style), but do not interpret it
+            const anyError = error as any;
+            const errorResponse = anyError?.response ?? anyError?.originalError?.response;
+
             let responseText = `ERROR: Failed to execute ${args.operation} operation on ${args.entityName}\n\n`;
             responseText += `Error Details: ${errorMessage}\n\n`;
+
+            // Include HTTP status and raw body if available
+            if (errorResponse) {
+                if (errorResponse.status) {
+                    responseText += `HTTP Status: ${errorResponse.status} ${errorResponse.statusText ?? ''}\n\n`;
+                }
+
+                responseText += `== RAW RESPONSE BODY ==\n`;
+                // Prefer the raw data from the client; fall back to the whole response object
+                const raw = errorResponse.data ?? errorResponse;
+                responseText += `${JSON.stringify(raw, null, 2)}\n\n`;
+            } else {
+                responseText += `No HTTP response body was provided by the client.\n\n`;
+            }
 
             if (mightBeSelectError) {
                 responseText += `⚠️ DETECTED: This error might be related to $select not being fully supported by this SAP API.\n\n`;
