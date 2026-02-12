@@ -24,7 +24,7 @@
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\"",
     "build:btp": "mbt build",
-    "deploy:btp": "cf deploy .\\mta_archives\\btp-sap-odata-to-mcp-server_1.0.0.mtar"
+    "deploy:btp": "cf deploy ./mta_archives/btp-sap-odata-to-mcp-server_1.0.0.mtar"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.1",
