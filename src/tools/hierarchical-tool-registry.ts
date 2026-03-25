@@ -414,7 +414,8 @@ export class HierarchicalSAPToolRegistry {
             // If service matches or no query, include service with minimal entity list
             if (serviceScore > 0 || !query) {
                 const entities = service.metadata?.entityTypes?.map(entity => ({
-                    entityName: entity.name
+                    entityName: entity.name,
+                    entitySet: entity.entitySet
                 })) || [];
 
                 matches.push({
@@ -435,9 +436,10 @@ export class HierarchicalSAPToolRegistry {
             if (service.metadata?.entityTypes && query) {
                 for (const entity of service.metadata.entityTypes) {
                     const entityNameLower = entity.name.toLowerCase();
+                    const entitySetLower = (entity.entitySet || '').toLowerCase();
 
-                    // Match entity name
-                    if (entityNameLower.includes(query)) {
+                    // Match entity name or entity set name
+                    if (entityNameLower.includes(query) || entitySetLower.includes(query)) {
                         matches.push({
                             type: "entity",
                             score: 0.95,
@@ -448,7 +450,8 @@ export class HierarchicalSAPToolRegistry {
                                 categories: this.serviceCategories.get(service.id) || []
                             },
                             entity: {
-                                entityName: entity.name
+                                entityName: entity.name,
+                                entitySet: entity.entitySet
                             },
                             matchReason: `Entity '${entity.name}' matches '${query}'`
                         });
@@ -1108,13 +1111,30 @@ export class HierarchicalSAPToolRegistry {
                 };
             }
 
-            // Validate entity
-            const entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
+            // Validate entity — accept both EntityType name and EntitySet name as input
+            let entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
             if (!entityType) {
+                entityType = service.metadata?.entityTypes?.find(e => e.entitySet === entityName);
+            }
+            if (!entityType) {
+                const availableEntities = service.metadata?.entityTypes
+                    ?.map(e => e.entitySet ? `${e.name} (entitySet: ${e.entitySet})` : e.name)
+                    .join(', ') || 'none';
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `ERROR: Entity '${entityName}' not found in service '${serviceId}'`
+                        text: `ERROR: Entity '${entityName}' not found in service '${serviceId}'\n\nAvailable entities: ${availableEntities}`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Ensure entity has an accessible EntitySet
+            if (!entityType.entitySet) {
+                return {
+                    content: [{
+                        type: "text" as const,
+                        text: `ERROR: Entity '${entityType.name}' has no EntitySet and cannot be queried directly. It may be a complex type or function return type.`
                     }],
                     isError: true
                 };

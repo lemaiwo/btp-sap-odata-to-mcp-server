@@ -27,16 +27,15 @@ export class SAPDiscoveryService {
             const filterConfig = this.config.getServiceFilterConfig();
             this.logger.info('OData service discovery configuration:', filterConfig);
 
-            // // Try OData V4 catalog first
-            // const v4Services = await this.discoverV4Services();
-            // services.push(...v4Services);
+            // Try OData V4 catalog first
+            const v4Services = await this.discoverV4Services();
+            services.push(...v4Services);
 
-            // Fallback to V2 service discovery
-            // if (services.length === 0) {
-                const v2Services = await this.discoverV2Services();
-                services.push(...v2Services);
+            // Also try V2 service discovery
+            const v2Services = await this.discoverV2Services();
+            services.push(...v2Services);
 
-                
+
             // Apply service filtering based on configuration
             const filteredServices = this.filterServices(services);
             this.logger.info(`Discovered ${services.length} total services, ${filteredServices.length} match the filter criteria`);
@@ -54,8 +53,10 @@ export class SAPDiscoveryService {
                 try {
                     this.logger.debug(`Discovering metadata for service: ${service.id} at ${service.metadataUrl}`);
                     service.metadata = await this.getServiceMetadata(service);
+                    this.logger.debug(`Metadata loaded for ${service.id}: ${service.metadata?.entityTypes?.length ?? 0} entity types`);
                 } catch (error) {
-                    this.logger.warn(`Failed to get metadata for service ${service.id}:`, error);
+                    const errMsg = error instanceof Error ? error.message : String(error);
+                    this.logger.warn(`Failed to get metadata for service ${service.id} (url: ${service.metadataUrl}): ${errMsg}`);
                 }
             }
 
@@ -177,7 +178,12 @@ export class SAPDiscoveryService {
         const results = (catalogData as { d?: { results?: V2Service[] } }).d?.results;
         if (results) {
             results.forEach((service) => {
-                const baseURL = `/sap/opu/odata/${service.ServiceUrl.split("/sap/opu/odata/")[1]}${service.TechnicalServiceName.includes("TASKPROCESSING") && Number(service.TechnicalServiceVersion)>1?`;mo`:``}/`;
+                const urlPart = service.ServiceUrl?.split("/sap/opu/odata/")[1];
+                if (!urlPart) {
+                    this.logger.warn(`Skipping V2 service ${service.ID}: cannot parse ServiceUrl '${service.ServiceUrl}'`);
+                    return;
+                }
+                const baseURL = `/sap/opu/odata/${urlPart}${service.TechnicalServiceName.includes("TASKPROCESSING") && Number(service.TechnicalServiceVersion)>1?`;mo`:``}/`;
                 services.push({
                     id: service.ID,
                     version: service.TechnicalServiceVersion || '0001',
@@ -195,22 +201,41 @@ export class SAPDiscoveryService {
     }
 
     private async getServiceMetadata(service: ODataService): Promise<ServiceMetadata> {
-        try {
-            const destination = await this.sapClient.getDestination();
+        const destination = await this.sapClient.getDestination();
 
-            const response = await executeHttpRequest(destination, {
-                method: 'GET',
-                url: service.metadataUrl,
-                headers: {
-                    'Accept': 'application/xml'
+        // For V4 services, try both srvd and srvd_a2x repository types
+        const urlsToTry = service.odataVersion === 'v4'
+            ? [service.metadataUrl, service.metadataUrl.replace('/srvd/', '/srvd_a2x/')]
+            : [service.metadataUrl];
+
+        let lastError: unknown;
+        for (const url of urlsToTry) {
+            try {
+                this.logger.debug(`Fetching $metadata: GET ${url}`);
+                const response = await executeHttpRequest(destination, {
+                    method: 'GET',
+                    url,
+                    headers: { 'Accept': 'application/xml' }
+                });
+                this.logger.debug(`$metadata response for ${service.id}: HTTP ${response.status} (${url})`);
+                // Update the service URL if fallback worked
+                if (url !== service.metadataUrl) {
+                    service.metadataUrl = url;
+                    service.url = url.replace('/$metadata', '/');
+                    this.logger.info(`Updated ${service.id} to use repository srvd_a2x`);
                 }
-            });
-            return this.parseMetadata(response.data, service.odataVersion);
-
-        } catch (error) {
-            this.logger.error(`Failed to get metadata for service ${service.id}:`, error);
-            throw error;
+                return this.parseMetadata(response.data, service.odataVersion);
+            } catch (error) {
+                const httpStatus = (error as { response?: { status?: number } })?.response?.status;
+                this.logger.warn(`Failed to fetch $metadata for ${service.id} [HTTP ${httpStatus ?? '?'}] at ${url}: ${error instanceof Error ? error.message : String(error)}`);
+                lastError = error;
+            }
         }
+
+        const errMsg = lastError instanceof Error ? lastError.message : String(lastError);
+        const httpStatus = (lastError as { response?: { status?: number } })?.response?.status;
+        this.logger.error(`Failed to fetch $metadata for ${service.id} [HTTP ${httpStatus ?? '?'}] at ${service.metadataUrl}: ${errMsg}`);
+        throw lastError;
     }
 
     private parseMetadata(metadataXml: string, odataVersion: string): ServiceMetadata {
@@ -233,7 +258,7 @@ export class SAPDiscoveryService {
         const nodes = xmlDoc.querySelectorAll("EntityType");
 
     nodes.forEach((node: Element) => {
-            const entitySet = entitySets.find(entitySet=>(entitySet.entitytype as string)?.split(".")[1] === node.getAttribute("Name"));
+            const entitySet = entitySets.find(entitySet=>(entitySet.entitytype as string)?.split(".").pop() === node.getAttribute("Name"));
             const entityType: EntityType =      {
                 name: node.getAttribute("Name") || '',
                 namespace: node.parentElement?.getAttribute("Namespace") || '',
