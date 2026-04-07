@@ -178,6 +178,22 @@ export class Config {
     }
 
     /**
+     * Maximum number of items returned in a single read response.
+     * Hard cap applied after SAP returns results — excess items are truncated.
+     */
+    getMaxResponseItems(): number {
+        return parseInt(process.env.MAX_RESPONSE_ITEMS || '100', 10);
+    }
+
+    /**
+     * Soft cap on serialized response size in bytes.
+     * When exceeded a warning is appended but the response is not truncated.
+     */
+    getMaxResponseBytes(): number {
+        return parseInt(process.env.MAX_RESPONSE_BYTES || '102400', 10);
+    }
+
+    /**
      * Get service filtering configuration for logging/debugging
      */
     getServiceFilterConfig(): Record<string, unknown> {

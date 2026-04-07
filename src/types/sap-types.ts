@@ -14,8 +14,23 @@ export interface ODataService {
 export interface ServiceMetadata {
     entityTypes: EntityType[];
     entitySets: Array<{ [key: string]: string | boolean | null }>;
+    functionImports: FunctionImport[];
     version: string;
     namespace: string;
+}
+
+export interface FunctionImport {
+    name: string;
+    httpMethod: 'GET' | 'POST';
+    returnType?: string;
+    parameters: FunctionParameter[];
+}
+
+export interface FunctionParameter {
+    name: string;
+    type: string;
+    mode: 'In' | 'Out' | 'InOut';
+    nullable: boolean;
 }
 
 export interface EntityType {

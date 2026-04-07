@@ -1,6 +1,7 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SAPClient } from "../services/sap-client.js";
 import { Logger } from "../utils/logger.js";
+import { Config } from "../utils/config.js";
 import { ODataService, EntityType } from "../types/sap-types.js";
 import { z } from "zod";
 
@@ -27,6 +28,7 @@ import { z } from "zod";
 export class HierarchicalSAPToolRegistry {
     private serviceCategories = new Map<string, string[]>();
     private userToken?: string;
+    private config: Config;
 
     constructor(
         private mcpServer: McpServer,
@@ -34,6 +36,7 @@ export class HierarchicalSAPToolRegistry {
         private logger: Logger,
         private discoveredServices: ODataService[]
     ) {
+        this.config = new Config();
         this.categorizeServices();
     }
 
@@ -56,12 +59,13 @@ export class HierarchicalSAPToolRegistry {
         this.mcpServer.registerTool(
             "discover-sap-data",
             {
-                title: "Level 1: Discover SAP Services and Entities",
-                description: "[LEVEL 1 - DISCOVERY] Search for SAP services and entities. Returns MINIMAL data (serviceId, serviceName, entityName) optimized for LLM decision making. If query matches, returns relevant results. If NO matches found, returns ALL available services with entities. After this call, use get-entity-metadata (Level 2) to get full schema details for your selected entity. Uses technical user (no auth needed).",
+                title: "Level 1: Discover SAP Services, Entities and Functions",
+                description: "[LEVEL 1 - DISCOVERY] Search for SAP services, entities, and function imports. Returns MINIMAL data (serviceId, serviceName, entityName, functionName) optimized for LLM decision making. If query matches, returns relevant results. If NO matches found, returns ALL available services with entities and functions. By default, call get-entity-metadata (Level 2) next to get full schema — OR use includeSchema:true when your query is precise to get the schema in one call. Uses technical user (no auth needed).",
                 inputSchema: {
-                    query: z.string().optional().describe("Search term to find services or entities. Searches service names, entity names. Examples: 'customer', 'sales order', 'employee'. If omitted or no matches found, returns ALL services with their entities (minimal fields only)."),
+                    query: z.string().optional().describe("Search term to find services, entities, or function imports. Examples: 'customer', 'GetNextPO', 'activate'. If omitted or no matches found, returns ALL services with their entities and functions (minimal fields only)."),
                     category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search to specific business area."),
-                    limit: z.number().min(1).max(50).optional().describe("Maximum number of results. Default: 20. Use higher limits when returning all services.")
+                    limit: z.number().min(1).max(this.discoveredServices.length || 200).optional().describe(`Maximum number of results. Default: 20. Use ${this.discoveredServices.length} to retrieve all available services.`),
+                    includeSchema: z.boolean().optional().describe("Include full entity schemas (properties, types, keys, capabilities) directly in Level 1 results. Only applied when the total number of matched entities is ≤ 5 to avoid context bloat. Default: false. Use true when your query is precise and you want to skip the get-entity-metadata call.")
                 }
             },
             async (args: Record<string, unknown>) => {
@@ -90,12 +94,12 @@ export class HierarchicalSAPToolRegistry {
             "execute-sap-operation",
             {
                 title: "Level 3: Execute SAP Operation",
-                description: "[LEVEL 3 - EXECUTION] AUTHENTICATION REQUIRED: Perform CRUD operations on SAP entities using authenticated user context. Requires valid JWT token for authorization. Use get-entity-metadata (Level 2) first to understand entity schema, then call this to execute operations. Operations execute under user's SAP identity with full audit trail.",
+                description: "[LEVEL 3 - EXECUTION] AUTHENTICATION REQUIRED: Perform CRUD operations on SAP entities using authenticated user context. Requires valid JWT token for authorization. Operations execute under user's SAP identity with full audit trail. When to call Level 2 first: REQUIRED for create/update/delete and filtered reads (need property names and key fields). OPTIONAL for simple read operations (top N without filter) — you can call this directly after discover-sap-data in that case.",
                 inputSchema: {
                     serviceId: z.string().describe("The SAP service ID from discover-sap-data. IMPORTANT: Use the 'id' field from the search results, NOT the 'title' field."),
                     entityName: z.string().describe("The entity name from discover-sap-data. IMPORTANT: Use the 'name' field from the results, NOT the 'entitySet' field."),
-                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, create, update, delete"),
-                    parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete operations, include the entity key properties. For create/update operations, include the entity data fields."),
+                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, count, create, update, delete, function. Use 'count' to get the total number of records without fetching data. Use 'function' to call an OData Function Import — set entityName to the function name and parameters to the function input parameters."),
+                    parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete: include entity key properties. For create/update: include entity data fields. For function: include function input parameters (use get-entity-metadata to get parameter names and types)."),
                     filterString: z.string().optional().describe("OData $filter query option value. Use OData filter syntax without the '$filter=' prefix. Examples: \"Status eq 'Active'\", \"Amount gt 1000\", \"Name eq 'John' and Status eq 'Active'\". Common operators: eq (equals), ne (not equals), gt (greater than), lt (less than), ge (greater/equal), le (less/equal), and, or, not."),
                     selectString: z.string().optional().describe("OData $select query option value. Comma-separated list of property names to include in the response, without the '$select=' prefix. Example: \"Name,Status,CreatedDate\" or \"CustomerID,CustomerName\". WARNING: Not all SAP OData APIs fully support $select. If the operation fails with a $select-related error, retry WITHOUT this parameter to get all properties."),
                     expandString: z.string().optional().describe("OData $expand query option value. Comma-separated list of navigation properties to expand, without the '$expand=' prefix. Example: \"Customer,Items\" or \"OrderDetails\"."),
@@ -185,6 +189,7 @@ export class HierarchicalSAPToolRegistry {
             const query = (args.query as string)?.toLowerCase() || "";
             const requestedCategory = (args.category as string)?.toLowerCase() || "all";
             const limit = (args.limit as number) || 20;
+            const includeSchema = args.includeSchema === true;
 
             // Validate category
             const validCategories = ["business-partner", "sales", "finance", "procurement", "hr", "logistics", "all"];
@@ -196,11 +201,29 @@ export class HierarchicalSAPToolRegistry {
             // Try to find matches
             matches = this.performMinimalSearch(query, category);
 
+            // If all matched services are unavailable (entityCount: 0), fall back to all services
+            const usableMatches = matches.filter(m => m.service.entityCount > 0);
+            if (matches.length > 0 && usableMatches.length === 0 && query) {
+                this.logger.debug(`Query '${query}' matched services but all have METADATA_UNAVAILABLE — returning all services`);
+                matches = this.performMinimalSearch("", category);
+                returnedAllServices = true;
+            }
+
             // If no matches found, return ALL services with minimal data
             if (matches.length === 0 && query) {
                 this.logger.debug(`No results found for query '${query}', returning all available services (minimal)`);
                 matches = this.performMinimalSearch("", category);
                 returnedAllServices = true;
+            }
+
+            // Sort: AVAILABLE services first, METADATA_UNAVAILABLE last
+            if (returnedAllServices) {
+                matches.sort((a, b) => {
+                    const aAvail = a.service.entityCount > 0 ? 0 : 1;
+                    const bAvail = b.service.entityCount > 0 ? 0 : 1;
+                    if (aAvail !== bAvail) return aAvail - bAvail;
+                    return a.service.serviceName.localeCompare(b.service.serviceName);
+                });
             }
 
             // Sort by relevance score (if searching) or alphabetically (if returning all)
@@ -219,12 +242,64 @@ export class HierarchicalSAPToolRegistry {
             const totalFound = matches.length;
             const limitedMatches = matches.slice(0, limit);
 
+            // Count total entities in the result set to decide whether schema inclusion is safe
+            let totalEntityCount = 0;
+            for (const match of limitedMatches) {
+                if (match.type === 'entity') {
+                    totalEntityCount += 1;
+                } else if (match.type === 'service') {
+                    totalEntityCount += (match.entities?.length || 0);
+                }
+            }
+
+            const SCHEMA_INCLUSION_THRESHOLD = 5;
+            const schemaIncluded = includeSchema && totalEntityCount <= SCHEMA_INCLUSION_THRESHOLD;
+            const schemaSkippedDueToSize = includeSchema && !schemaIncluded;
+
+            // Enrich matches with full schemas when safe to do so
+            if (schemaIncluded) {
+                for (const match of limitedMatches) {
+                    const service = this.discoveredServices.find(s => s.id === match.service.serviceId);
+                    if (!service?.metadata?.entityTypes) continue;
+
+                    const buildSchema = (entityName: string) => {
+                        const entity = service.metadata!.entityTypes!.find(e => e.name === entityName);
+                        if (!entity) return undefined;
+                        return {
+                            keyProperties: entity.keys,
+                            capabilities: {
+                                creatable: entity.creatable,
+                                updatable: entity.updatable,
+                                deletable: entity.deletable
+                            },
+                            properties: entity.properties.map(p => ({
+                                name: p.name,
+                                type: p.type,
+                                nullable: p.nullable,
+                                maxLength: p.maxLength,
+                                isKey: entity.keys.includes(p.name)
+                            }))
+                        };
+                    };
+
+                    if (match.type === 'entity' && match.entity) {
+                        match.entity.schema = buildSchema(match.entity.entityName);
+                    } else if (match.type === 'service' && match.entities) {
+                        match.entities = match.entities.map((e: { entityName: string }) => ({
+                            ...e,
+                            schema: buildSchema(e.entityName)
+                        }));
+                    }
+                }
+            }
+
             const result = {
                 query: query || "all",
                 category: category,
                 returnedAllServices: returnedAllServices,
                 totalFound: totalFound,
                 showing: limitedMatches.length,
+                schemaIncluded: schemaIncluded,
                 matches: limitedMatches
             };
 
@@ -232,15 +307,25 @@ export class HierarchicalSAPToolRegistry {
             let responseText = "";
 
             if (returnedAllServices) {
-                responseText += `[LEVEL 1 - NO MATCHES] No results found for "${query}". Returning ALL available services and entities.\n\n`;
+                responseText += `[LEVEL 1 - NO MATCHES] No usable results found for "${query}" (matched services have unavailable metadata). Returning ALL available services and entities.\n\n`;
             } else if (query) {
                 responseText += `[LEVEL 1 - SEARCH RESULTS] Found ${totalFound} matches for "${query}"\n\n`;
             } else {
                 responseText += `[LEVEL 1 - ALL SERVICES] Showing all available services and entities\n\n`;
             }
 
-            responseText += `NEXT STEP: Select a service and entity from the results below, then call get-entity-metadata\n`;
-            responseText += `  with the serviceId and entityName to get full schema details.\n\n`;
+            if (schemaIncluded) {
+                responseText += `✅ SCHEMA INCLUDED: Full entity schemas are in the results below (${totalEntityCount} entities ≤ threshold of ${SCHEMA_INCLUSION_THRESHOLD}).\n`;
+                responseText += `NEXT STEP: You can call execute-sap-operation directly — no need to call get-entity-metadata.\n\n`;
+            } else if (schemaSkippedDueToSize) {
+                responseText += `⚠️ SCHEMA NOT INCLUDED: includeSchema was requested but ${totalEntityCount} entities exceed the threshold of ${SCHEMA_INCLUSION_THRESHOLD}.\n`;
+                responseText += `Narrow your query to ≤ ${SCHEMA_INCLUSION_THRESHOLD} entities, or call get-entity-metadata for the specific entity you need.\n\n`;
+            } else {
+                responseText += `NEXT STEP: Select a service and entity from the results below, then either:\n`;
+                responseText += `  - Call get-entity-metadata (serviceId, entityName) to get the full schema before write operations\n`;
+                responseText += `  - Call execute-sap-operation directly for a simple read (no schema needed)\n\n`;
+            }
+
             responseText += `Results (showing ${limitedMatches.length} of ${totalFound}):\n\n`;
             responseText += JSON.stringify(result, null, 2);
 
@@ -294,14 +379,40 @@ export class HierarchicalSAPToolRegistry {
                 };
             }
 
+            // Check if it's a function import first
+            const functionImport = service.metadata?.functionImports?.find(f => f.name === entityName);
+            if (functionImport) {
+                const metadata = {
+                    service: { serviceId: service.id, serviceName: service.title, odataVersion: service.odataVersion },
+                    function: {
+                        name: functionImport.name,
+                        httpMethod: functionImport.httpMethod,
+                        returnType: functionImport.returnType || 'void',
+                        parameters: functionImport.parameters
+                    }
+                };
+                let responseText = `[LEVEL 2 - FUNCTION METADATA] Schema for function '${entityName}' in ${service.title}\n\n`;
+                responseText += `NEXT STEP: Use execute-sap-operation with:\n`;
+                responseText += `  - serviceId: "${serviceId}"\n`;
+                responseText += `  - entityName: "${entityName}"\n`;
+                responseText += `  - operation: "function"\n`;
+                responseText += `  - parameters: { ${functionImport.parameters.filter(p => p.mode !== 'Out').map(p => `"${p.name}": <${p.type}>`).join(', ')} }\n\n`;
+                responseText += `HTTP Method: ${functionImport.httpMethod}\n`;
+                responseText += `Return Type: ${functionImport.returnType || 'void'}\n\n`;
+                responseText += `Full Metadata:\n\n`;
+                responseText += JSON.stringify(metadata, null, 2);
+                return { content: [{ type: "text" as const, text: responseText }] };
+            }
+
             // Find the entity
             const entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
             if (!entityType) {
                 const availableEntities = service.metadata?.entityTypes?.map(e => e.name).join(', ') || 'none';
+                const availableFunctions = service.metadata?.functionImports?.map(f => f.name).join(', ') || 'none';
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `ERROR: Entity '${entityName}' not found in service '${serviceId}'\n\nAvailable entities: ${availableEntities}`
+                        text: `ERROR: '${entityName}' not found in service '${serviceId}'\n\nAvailable entities: ${availableEntities}\nAvailable functions: ${availableFunctions}`
                     }],
                     isError: true
                 };
@@ -334,6 +445,11 @@ export class HierarchicalSAPToolRegistry {
                     nullable: prop.nullable,
                     maxLength: prop.maxLength,
                     isKey: entityType.keys.includes(prop.name)
+                })),
+                navigationProperties: entityType.navigationProperties.map(nav => ({
+                    name: nav.name,
+                    targetEntityType: nav.type,
+                    multiplicity: nav.multiplicity
                 }))
             };
 
@@ -345,6 +461,13 @@ export class HierarchicalSAPToolRegistry {
             responseText += `  - Use the properties below to construct parameters\n\n`;
             responseText += `Key Properties: [${entityType.keys.join(', ')}]\n`;
             responseText += `Capabilities: creatable=${entityType.creatable}, updatable=${entityType.updatable}, deletable=${entityType.deletable}\n\n`;
+            if (entityType.navigationProperties.length > 0) {
+                responseText += `Navigation Properties (for deep insert or expand):\n`;
+                entityType.navigationProperties.forEach(nav => {
+                    responseText += `  - ${nav.name} → ${nav.type || 'unknown'} (${nav.multiplicity})\n`;
+                });
+                responseText += `\nNOTE: SAP OData V2 only supports ONE level of deep insert. You can include a top-level navigation property (e.g. to_PurchaseReqnItem) in a create body, but you CANNOT nest further navigation properties inside those items. Create nested sub-entities (e.g. account assignments) in a separate step.\n\n`;
+            }
             responseText += `Full Metadata:\n\n`;
             responseText += JSON.stringify(metadata, null, 2);
 
@@ -372,6 +495,18 @@ export class HierarchicalSAPToolRegistry {
      * Returns only essential fields: serviceId, serviceName, entityName
      * Optimized for LLM token efficiency
      */
+    /**
+     * Match text against a query: supports both combined ("purchaseorder")
+     * and separated multi-word ("purchase order") matching.
+     */
+    private matchesQueryMinimal(text: string, query: string): boolean {
+        if (!query) return false;
+        if (text.includes(query)) return true;
+        // Multi-word: all words must appear in text
+        const words = query.split(/\s+/).filter(w => w.length > 1);
+        return words.length > 1 && words.every(w => text.includes(w));
+    }
+
     private performMinimalSearch(query: string, category: string): Array<{
         type: 'service' | 'entity';
         score: number;
@@ -381,41 +516,41 @@ export class HierarchicalSAPToolRegistry {
             entityCount: number;
             categories: string[];
         };
-        entities?: Array<{
-            entityName: string;
-        }>;
-        entity?: {
-            entityName: string;
-        };
+        entities?: Array<{ entityName: string }>;
+        entity?: { entityName: string };
         matchReason?: string;
     }> {
         const matches: Array<any> = [];
 
-        // Search across all services
         for (const service of this.discoveredServices) {
-            // Filter by category first
             if (category !== "all") {
                 const serviceCategories = this.serviceCategories.get(service.id) || [];
-                if (!serviceCategories.includes(category)) {
-                    continue;
-                }
+                if (!serviceCategories.includes(category)) continue;
             }
 
             const serviceIdLower = service.id.toLowerCase();
             const serviceTitleLower = service.title.toLowerCase();
+            const serviceDescLower = service.description.toLowerCase();
 
-            // Service-level match
+            // Service-level match — check id, title, description with multi-word support
             let serviceScore = 0;
             if (query) {
-                if (serviceIdLower.includes(query)) serviceScore = 0.9;
-                else if (serviceTitleLower.includes(query)) serviceScore = 0.85;
+                if (this.matchesQueryMinimal(serviceIdLower, query)) serviceScore = 0.9;
+                else if (this.matchesQueryMinimal(serviceTitleLower, query)) serviceScore = 0.85;
+                else if (this.matchesQueryMinimal(serviceDescLower, query)) serviceScore = 0.7;
             }
 
-            // If service matches or no query, include service with minimal entity list
+            // If service matches or no query, include service with minimal entity + function list
             if (serviceScore > 0 || !query) {
                 const entities = service.metadata?.entityTypes?.map(entity => ({
                     entityName: entity.name
                 })) || [];
+                const functions = service.metadata?.functionImports?.map(fn => ({
+                    functionName: fn.name,
+                    httpMethod: fn.httpMethod,
+                    returnType: fn.returnType
+                })) || [];
+                const isAvailable = entities.length > 0 || functions.length > 0;
 
                 matches.push({
                     type: "service",
@@ -424,33 +559,51 @@ export class HierarchicalSAPToolRegistry {
                         serviceId: service.id,
                         serviceName: service.title,
                         entityCount: entities.length,
+                        functionCount: functions.length,
+                        status: isAvailable ? "AVAILABLE" : "METADATA_UNAVAILABLE",
                         categories: this.serviceCategories.get(service.id) || []
                     },
-                    entities: entities,
+                    entities,
+                    functions,
                     matchReason: serviceScore > 0 ? `Service matches '${query}'` : `Service in category '${category}'`
                 });
             }
 
-            // Entity-level matches within this service (only if query provided)
-            if (service.metadata?.entityTypes && query) {
-                for (const entity of service.metadata.entityTypes) {
-                    const entityNameLower = entity.name.toLowerCase();
-
-                    // Match entity name
-                    if (entityNameLower.includes(query)) {
+            // Entity-level and function-level matches (only if query provided)
+            if (query) {
+                for (const entity of (service.metadata?.entityTypes || [])) {
+                    if (this.matchesQueryMinimal(entity.name.toLowerCase(), query)) {
                         matches.push({
                             type: "entity",
                             score: 0.95,
                             service: {
                                 serviceId: service.id,
                                 serviceName: service.title,
-                                entityCount: service.metadata.entityTypes.length,
+                                entityCount: service.metadata?.entityTypes?.length || 0,
                                 categories: this.serviceCategories.get(service.id) || []
                             },
-                            entity: {
-                                entityName: entity.name
-                            },
+                            entity: { entityName: entity.name },
                             matchReason: `Entity '${entity.name}' matches '${query}'`
+                        });
+                    }
+                }
+                for (const fn of (service.metadata?.functionImports || [])) {
+                    if (fn.name.toLowerCase().includes(query)) {
+                        matches.push({
+                            type: "function",
+                            score: 0.95,
+                            service: {
+                                serviceId: service.id,
+                                serviceName: service.title,
+                                categories: this.serviceCategories.get(service.id) || []
+                            },
+                            function: {
+                                functionName: fn.name,
+                                httpMethod: fn.httpMethod,
+                                returnType: fn.returnType,
+                                parameterCount: fn.parameters.length
+                            },
+                            matchReason: `Function '${fn.name}' matches '${query}'`
                         });
                     }
                 }
@@ -1062,7 +1215,7 @@ export class HierarchicalSAPToolRegistry {
             const parameters = args.parameters as Record<string, unknown> || {};
 
             // Validate operation for better Copilot compatibility
-            const validOperations = ["read", "read-single", "create", "update", "delete"];
+            const validOperations = ["read", "read-single", "count", "create", "update", "delete", "function"];
             if (!validOperations.includes(operation)) {
                 throw new Error(`Invalid operation: ${operation}. Valid operations are: ${validOperations.join(', ')}`);
             }
@@ -1079,6 +1232,19 @@ export class HierarchicalSAPToolRegistry {
             // Also support legacy queryOptions object for backward compatibility
             if (args.queryOptions && typeof args.queryOptions === 'object') {
                 Object.assign(queryOptions, args.queryOptions);
+            }
+
+            // Apply a conservative default $top when none is specified, to avoid fetching entire tables.
+            // Use $top=0 explicitly for count-only queries (no records needed, just the inline count).
+            const DEFAULT_READ_TOP = 20;
+            if (operation === 'read' && queryOptions.$top === undefined) {
+                this.logger.info(`No $top specified for read operation, defaulting to ${DEFAULT_READ_TOP}. Use topNumber=0 for count-only queries.`);
+                queryOptions.$top = DEFAULT_READ_TOP;
+            }
+
+            // Always include inline count for read operations so the model knows the total without fetching all records
+            if (operation === 'read' && !queryOptions.$inlinecount) {
+                queryOptions.$inlinecount = 'allpages';
             }
 
             const useUserToken = args.useUserToken !== false; // Default to true
@@ -1108,6 +1274,35 @@ export class HierarchicalSAPToolRegistry {
                 };
             }
 
+            // For function operations, validate against functionImports instead of entityTypes
+            if (operation === 'function') {
+                const functionImport = service.metadata?.functionImports?.find(f => f.name === entityName);
+                if (!functionImport) {
+                    const availableFunctions = service.metadata?.functionImports?.map(f => f.name).join(', ') || 'none';
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: `ERROR: Function '${entityName}' not found in service '${serviceId}'\n\nAvailable functions: ${availableFunctions}\nUse discover-sap-data to find function names.`
+                        }],
+                        isError: true
+                    };
+                }
+                if (useUserToken && this.userToken) this.sapClient.setUserToken(this.userToken);
+                else this.sapClient.setUserToken(undefined);
+
+                const operationDescription = `Calling function '${entityName}' (${functionImport.httpMethod})`;
+                this.logger.info(operationDescription);
+                const response = await this.sapClient.callFunction(
+                    service.url, functionImport.name, parameters, functionImport.httpMethod
+                );
+                return {
+                    content: [{
+                        type: "text" as const,
+                        text: `SUCCESS: ${operationDescription}\n\n== RESULT ==\n${JSON.stringify(response.data, null, 2)}`
+                    }]
+                };
+            }
+
             // Validate entity
             const entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
             if (!entityType) {
@@ -1130,14 +1325,28 @@ export class HierarchicalSAPToolRegistry {
             // Execute the operation
             let response;
             let operationDescription = "";
+            let strippedNavigationPaths: string[] = [];
 
             switch (operation) {
+                case 'count': {
+                    const countFilter = queryOptions.$filter as string | undefined;
+                    operationDescription = `Counting ${entityName} entities`;
+                    if (countFilter) operationDescription += ` with filter: ${countFilter}`;
+                    const totalCount = await this.sapClient.countEntitySet(service.url, entityType.entitySet!, countFilter);
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: `SUCCESS: ${operationDescription}\n\nTOTAL COUNT: ${totalCount} records`
+                        }]
+                    };
+                }
+
                 case 'read':
                     operationDescription = `Reading ${entityName} entities`;
                     if (queryOptions.$top) operationDescription += ` (top ${queryOptions.$top})`;
                     if (queryOptions.$filter) operationDescription += ` with filter: ${queryOptions.$filter}`;
 
-                    response = await this.sapClient.readEntitySet(service.url, entityType.entitySet!, queryOptions, false);
+                    response = await this.sapClient.readEntitySet(service.url, entityType.entitySet!, queryOptions, false, service.odataVersion);
                     break;
 
                 case 'read-single': {
@@ -1152,7 +1361,13 @@ export class HierarchicalSAPToolRegistry {
                         throw new Error(`Entity '${entityName}' does not support create operations`);
                     }
                     operationDescription = `Creating new ${entityName}`;
-                    response = await this.sapClient.createEntity(service.url, entityType.entitySet!, parameters);
+                    {
+                        // SAP OData V2 only supports one level of deep insert.
+                        // Strip navigation properties (to_*) nested within top-level navigation property arrays.
+                        const { cleaned: cleanedParams, stripped } = this.extractNestedNavigationProperties(parameters);
+                        strippedNavigationPaths = stripped;
+                        response = await this.sapClient.createEntity(service.url, entityType.entitySet!, cleanedParams);
+                    }
                     break;
 
                 case 'update':
@@ -1185,8 +1400,93 @@ export class HierarchicalSAPToolRegistry {
             }
 
             let responseText = `SUCCESS: ${operationDescription}\n\n`;
-            responseText += `== RESULT ==\n`;
-            responseText += JSON.stringify(response.data, null, 2);
+
+            // For read operations: apply item cap, pagination hints, and size warning
+            if (operation === 'read') {
+                const maxItems = this.config.getMaxResponseItems();
+                const maxBytes = this.config.getMaxResponseBytes();
+
+                // Handle both v2 envelope (d.results / d.__count) and v4 envelope (value / @odata.count)
+                const data = response.data?.d || response.data;
+                const inlineCount = data?.__count ?? data?.['@odata.count'] ?? response.data?.['@odata.count'];
+                let results: unknown[] | null = data?.results || (Array.isArray(data) ? data : null);
+                const currentSkip = (args.skipNumber as number) || 0;
+                const currentTop = (args.topNumber as number) || 20;
+
+                // Apply hard item cap
+                let truncated = false;
+                if (results && results.length > maxItems) {
+                    results = results.slice(0, maxItems);
+                    truncated = true;
+                    // Patch the response so JSON.stringify reflects the truncation
+                    if (response.data?.d?.results) {
+                        response.data.d.results = results;
+                    } else if (response.data?.results) {
+                        response.data.results = results;
+                    } else if (Array.isArray(response.data)) {
+                        response.data = results;
+                    }
+                }
+
+                const returnedCount = results?.length ?? '?';
+                const totalCount = inlineCount !== undefined ? Number(inlineCount) : null;
+
+                // Summary line
+                if (totalCount !== null) {
+                    responseText += `TOTAL COUNT: ${totalCount} records`;
+                    responseText += ` (returning ${returnedCount}`;
+                    if (truncated) responseText += `, capped at MAX_RESPONSE_ITEMS=${maxItems}`;
+                    responseText += `)\n`;
+                } else {
+                    responseText += `RETURNED: ${returnedCount} records\n`;
+                }
+
+                // Pagination hints
+                const effectiveReturned = Number(returnedCount);
+                const hasMore = totalCount !== null
+                    ? currentSkip + effectiveReturned < totalCount
+                    : truncated;
+
+                if (hasMore) {
+                    const nextSkip = currentSkip + effectiveReturned;
+                    responseText += `PAGINATION: More records available.\n`;
+                    responseText += `  → Next page: skipNumber=${nextSkip}, topNumber=${currentTop}\n`;
+                    if (totalCount !== null) {
+                        const remaining = totalCount - nextSkip;
+                        responseText += `  → Remaining: ~${remaining} records\n`;
+                    }
+                    responseText += `  → For count only (no records): operation="count"\n`;
+                }
+                responseText += `\n`;
+
+                // Serialize and check size
+                const serialized = JSON.stringify(response.data, null, 2);
+                const sizeBytes = Buffer.byteLength(serialized, 'utf8');
+
+                if (sizeBytes > maxBytes) {
+                    const sizeKb = Math.round(sizeBytes / 1024);
+                    const limitKb = Math.round(maxBytes / 1024);
+                    responseText += `⚠️ LARGE RESPONSE: ~${sizeKb}KB (limit ${limitKb}KB). Consider:\n`;
+                    responseText += `  - Adding selectString to return only needed properties\n`;
+                    responseText += `  - Reducing topNumber\n`;
+                    responseText += `  - Adding filterString to narrow results\n\n`;
+                }
+
+                responseText += `== RESULT ==\n`;
+                responseText += serialized;
+            } else {
+                responseText += `== RESULT ==\n`;
+                responseText += JSON.stringify(response.data, null, 2);
+            }
+
+            if (strippedNavigationPaths.length > 0) {
+                responseText += `\n\n⚠️ NOTE: The following nested navigation properties were automatically removed from the request body. SAP OData V2 does not support multi-level deep inserts (navigation properties nested within other navigation properties).\n`;
+                responseText += `You must create these sub-entities separately using individual create operations:\n`;
+                strippedNavigationPaths.forEach(path => {
+                    responseText += `  - ${path}\n`;
+                });
+                responseText += `\nFor example, to create account assignments for a purchase requisition item, use a separate execute-sap-operation call with operation: "create" on the PurReqnAcctAssgmt entity, providing the PurchaseRequisition and PurchaseRequisitionItem key fields from the result above.`;
+            }
 
             return {
                 content: [{
@@ -1251,6 +1551,46 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
+     * Extract nested navigation properties from a create request body.
+     * SAP OData V2 supports only one level of deep insert: top-level navigation properties
+     * (e.g. to_PurchaseReqnItem inside PurchaseRequisitionHeader) are kept.
+     * Navigation properties nested within those arrays (e.g. to_PurReqnAcctAssgmt inside an item)
+     * are stripped and their paths recorded for user notification.
+     */
+    private extractNestedNavigationProperties(data: Record<string, unknown>): {
+        cleaned: Record<string, unknown>;
+        stripped: string[];
+    } {
+        const cleaned: Record<string, unknown> = {};
+        const stripped: string[] = [];
+
+        for (const [key, value] of Object.entries(data)) {
+            if (key.startsWith('to_') && Array.isArray(value)) {
+                // Top-level navigation property array — keep it but strip nav props from each item
+                const cleanedItems = value.map((item: unknown, index: number) => {
+                    if (item && typeof item === 'object' && !Array.isArray(item)) {
+                        const cleanedItem: Record<string, unknown> = {};
+                        for (const [itemKey, itemValue] of Object.entries(item as Record<string, unknown>)) {
+                            if (itemKey.startsWith('to_')) {
+                                stripped.push(`${key}[${index}].${itemKey}`);
+                            } else {
+                                cleanedItem[itemKey] = itemValue;
+                            }
+                        }
+                        return cleanedItem;
+                    }
+                    return item;
+                });
+                cleaned[key] = cleanedItems;
+            } else {
+                cleaned[key] = value;
+            }
+        }
+
+        return { cleaned, stripped };
+    }
+
+    /**
      * Build key value for entity operations (handles single and composite keys)
      */
     private buildKeyValue(entityType: EntityType, parameters: Record<string, unknown>): string {
@@ -1261,7 +1601,7 @@ export class HierarchicalSAPToolRegistry {
             if (!(keyName in parameters)) {
                 throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return String(parameters[keyName]);
+            return `'${String(parameters[keyName])}'`;
         }
 
         // Handle composite keys
@@ -1486,8 +1826,10 @@ LEVEL 1: discover-sap-data (LIGHTWEIGHT DISCOVERY)
   - query (optional): Search term for services/entities
   - category (optional): Filter by business area (business-partner, sales, finance, etc.)
   - limit (optional): Maximum results (default: 20)
+  - includeSchema (optional): Include full entity schemas when ≤ 5 entities matched. Default: false.
 - Examples:
   - { query: "customer" } → Returns list of services/entities matching "customer"
+  - { query: "BankAccount", includeSchema: true } → Returns schema directly if ≤ 5 entities matched
   - { query: "" } → Returns all available services with their entities
 - Use this: When you need to find or explore what's available
 
@@ -1497,33 +1839,38 @@ LEVEL 2: get-entity-metadata (FULL SCHEMA DETAILS)
 - Parameters:
   - serviceId (required): From Level 1 results
   - entityName (required): From Level 1 results
-- Use this: After selecting service/entity from Level 1, before executing operations
-- Provides all details needed to construct proper CRUD operations
+- Use this: When you need property names and key fields for write operations or filtered reads
+- Can be skipped for simple read operations (see workflows below)
 
 LEVEL 3: execute-sap-operation (AUTHENTICATED EXECUTION)
 - Purpose: Perform CRUD operations on entities
 - Parameters: serviceId, entityName, operation, parameters, OData options
-- Operations: read, read-single, create, update, delete
+- Operations: read, read-single, create, update, delete, count
 - Requires: User authentication (JWT token)
-- Use this: After getting schema from Level 2 to execute actual operations
+- Level 2 REQUIRED before this for: create, update, delete, read-single, filtered reads
+- Level 2 OPTIONAL for: simple read (top N, no filter) — can call directly after Level 1
 
-== RECOMMENDED WORKFLOW ==
+== RECOMMENDED WORKFLOWS ==
 
-✅ CORRECT 3-Level Workflow:
-1. discover-sap-data → Find relevant services/entities (minimal data)
-2. get-entity-metadata → Get full schema for selected entity
-3. execute-sap-operation → Execute operation using schema from step 2
+Choose the workflow that fits the task:
 
-Benefits of 3-Level Approach:
-- Token Efficient: Level 1 returns minimal data for decision making
-- Progressive Detail: Only fetch full schemas when needed (Level 2)
-- Clear Separation: Discovery → Metadata → Execution
-- Better for LLMs: Smaller responses, clearer workflow
+✅ FAST WORKFLOW — Simple read (2 steps, no schema needed):
+1. discover-sap-data { query: "X" } → get serviceId + entityName
+2. execute-sap-operation { operation: "read", topNumber: 10 } → execute directly
 
-⚠️ IMPORTANT: Do NOT skip Level 2!
-- Level 1 gives you entity names to choose from
-- Level 2 gives you the schema details needed for operations
-- Level 3 executes with proper parameters from Level 2
+✅ SINGLE-PASS WORKFLOW — Precise query, any operation (2 steps, schema in Level 1):
+1. discover-sap-data { query: "X", includeSchema: true } → schema included if ≤ 5 entities matched
+2. execute-sap-operation → execute immediately using schema from step 1
+
+✅ FULL WORKFLOW — Write operations or complex reads (3 steps):
+1. discover-sap-data { query: "X" } → get serviceId + entityName
+2. get-entity-metadata { serviceId, entityName } → get full schema (property names, keys, capabilities)
+3. execute-sap-operation → execute with correct parameters from step 2
+
+Decision guide:
+- User says "show me some X data" → FAST workflow
+- User says "find the X with key Y" or "update X" or "create X" → FULL workflow
+- Query is very specific (single known entity) → SINGLE-PASS workflow
 
 == BEST PRACTICES ==
 
@@ -1533,13 +1880,18 @@ Authentication Guidance:
 - Explain that discovery uses technical user, operations use their credentials
 
 Query Optimization:
-- Use OData query options (filterString, topNumber) to limit data
-- Encourage filtering to avoid large result sets
-- Show users how to construct proper OData filters
+- ALWAYS specify topNumber explicitly based on the task:
+  * topNumber=0  → count-only query (no records returned, just TOTAL COUNT)
+  * topNumber=5  → spot-check / existence check
+  * topNumber=20 → default exploration (server applies this if omitted)
+  * topNumber=N  → when you know exactly how many records you need
+- Use filterString to narrow results before increasing topNumber
+- Combine selectString + small topNumber to minimise token usage
 - IMPORTANT: selectString ($select) is NOT fully supported by all SAP OData APIs
   * If operation fails with $select-related error, retry WITHOUT selectString
   * The error handler will detect this and provide automatic retry instructions
   * Some SAP APIs silently ignore $select, others return errors
+- When TOTAL COUNT > records returned, use skipNumber to paginate
 
 Error Handling:
 - If entity not found, suggest using discovery tools first

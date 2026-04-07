@@ -18,7 +18,7 @@ modules:
     path: ./
     parameters:
       app-name: sap-mcp-server-${space}
-      memory: 512M
+      memory: 256M
       disk-quota: 1G
       buildpack: nodejs_buildpack
       command: npm run start
@@ -27,8 +27,12 @@ modules:
       health-check-http-endpoint: /health
       timeout: 180
     properties:
-      LOG_LEVEL: debug
-      
+      LOG_LEVEL: info
+      SAP_DISCOVERY_DESTINATION_NAME: MCP_Execution
+      SAP_EXECUTION_DESTINATION_NAME: MCP_Execution
+      ODATA_MAX_SERVICES: 110
+      ODATA_SERVICE_PATTERNS: "*PURCHASEREQ*,*PURCHASEORDER*,*SALESORDER*,*SUPPLIER*,*CUSTOMER*,*PRODUCT*,*MATERIAL*,*FINANC*,*COST*,*TASKPROCESSING*,*INVOICE*,*DELIVERY*,*PRICING*"
+      ODATA_EXCLUSION_PATTERNS: "*_TEST*,*_TEMP*"
     build-parameters:
       builder: custom
       commands:
@@ -37,6 +41,7 @@ modules:
         - node_modules/
         - .git/
         - tests/
+        - .env
     requires:
       - name: sap-mcp-destination
       - name: sap-mcp-connectivity
