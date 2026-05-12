@@ -28,6 +28,8 @@ modules:
       timeout: 180
     properties:
       LOG_LEVEL: debug
+      SAP_DISCOVERY_DESTINATION_NAME: SAP_SYSTEM_TECH_SBX
+      SAP_EXECUTION_DESTINATION_NAME: SAP_SYSTEM_SSO_SBX
       
     build-parameters:
       builder: custom

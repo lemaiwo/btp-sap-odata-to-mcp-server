@@ -255,14 +255,20 @@ export class SAPDiscoveryService {
 
     private extractEntityTypes(xmlDoc: Document, entitySets: Array<{ [key: string]: string | boolean | null }>): EntityType[] {
         const entityTypes: EntityType[] = [];
+        // Maps FQN → EntityType and baseTypeFQN for second-pass inheritance resolution
+        const fqnToEntityType = new Map<string, EntityType>();
+        const derivedToBase = new Map<string, string>(); // derivedFQN → baseFQN
+
         const nodes = xmlDoc.querySelectorAll("EntityType");
 
-    nodes.forEach((node: Element) => {
+        nodes.forEach((node: Element) => {
             const entitySet = entitySets.find(entitySet=>(entitySet.entitytype as string)?.split(".").pop() === node.getAttribute("Name"));
-            const entityType: EntityType =      {
-                name: node.getAttribute("Name") || '',
-                namespace: node.parentElement?.getAttribute("Namespace") || '',
-                entitySet:entitySet?.name as string,
+            const namespace = node.parentElement?.getAttribute("Namespace") || '';
+            const name = node.getAttribute("Name") || '';
+            const entityType: EntityType = {
+                name,
+                namespace,
+                entitySet: entitySet?.name as string,
                 creatable: !!entitySet?.creatable,
                 updatable: !!entitySet?.updatable,
                 deletable: !!entitySet?.deletable,
@@ -283,13 +289,40 @@ export class SAPDiscoveryService {
                 });
             });
 
-            // Extract keys
-            const keyNodes = node.querySelectorAll("Key PropertyRef");
+            // Extract keys (lowercase selector required: JSDOM stores tagNames in uppercase
+            // and its CSS engine fails on mixed-case compound selectors like "Key PropertyRef")
+            const keyNodes = node.querySelectorAll("key propertyref");
             keyNodes.forEach((keyNode: Element) => {
                 entityType.keys.push(keyNode.getAttribute("Name") || '');
             });
 
+            // Track BaseType for second-pass inheritance resolution
+            const baseType = node.getAttribute("BaseType");
+            const fqn = namespace ? `${namespace}.${name}` : name;
+            fqnToEntityType.set(fqn, entityType);
+            fqnToEntityType.set(name, entityType); // also by short name
+            if (baseType && entityType.keys.length === 0) {
+                derivedToBase.set(fqn, baseType);
+            }
+
             entityTypes.push(entityType);
+        });
+
+        // Second pass: resolve BaseType key inheritance
+        derivedToBase.forEach((baseFqn, derivedFqn) => {
+            const derived = fqnToEntityType.get(derivedFqn);
+            if (!derived || derived.keys.length > 0) return;
+
+            // Try FQN, then short name (last segment after '.')
+            const base = fqnToEntityType.get(baseFqn)
+                ?? fqnToEntityType.get(baseFqn.split('.').pop() || '');
+            if (!base || base.keys.length === 0) return;
+
+            derived.keys = [...base.keys];
+            // Copy key properties that are not already present in the derived type
+            base.properties
+                .filter(p => base.keys.includes(p.name) && !derived.properties.find(dp => dp.name === p.name))
+                .forEach(p => derived.properties.push(p));
         });
 
         return entityTypes;

@@ -121,7 +121,7 @@ export class SAPClient {
     }
 
     async readEntity(servicePath: string, entitySet: string, key: string, isDiscovery = false) {
-        const url = `${servicePath}${entitySet}('${key}')`;
+        const url = `${servicePath}${entitySet}(${key})`;
 
         return this.executeRequest({
             method: 'GET',
@@ -141,7 +141,7 @@ export class SAPClient {
     }
 
     async updateEntity(servicePath: string, entitySet: string, key: string, data: unknown) {
-        const url = `${servicePath}${entitySet}('${key}')`;
+        const url = `${servicePath}${entitySet}(${key})`;
 
         return this.executeRequest({
             method: 'PATCH',
@@ -151,7 +151,7 @@ export class SAPClient {
     }
 
     async deleteEntity(servicePath: string, entitySet: string, key: string) {
-        const url = `${servicePath}${entitySet}('${key}')`;
+        const url = `${servicePath}${entitySet}(${key})`;
 
         return this.executeRequest({
             method: 'DELETE',
@@ -164,10 +164,28 @@ export class SAPClient {
             typeof error === 'object' &&
             error !== null &&
             'rootCause' in error &&
-            (error as { rootCause?: { response?: { status: number; data?: { error?: { message?: string } }; statusText?: string } } }).rootCause?.response
+            (error as { rootCause?: { response?: { status: number; data?: unknown; statusText?: string } } }).rootCause?.response
         ) {
-            const response = (error as { rootCause: { response: { status: number; data?: { error?: { message?: string } }; statusText?: string } } }).rootCause.response;
-            return new Error(`SAP API Error ${response.status}: ${response.data?.error?.message || response.statusText}`);
+            const response = (error as { rootCause: { response: { status: number; data?: unknown; statusText?: string } } }).rootCause.response;
+            const data = response.data as { error?: { code?: string; message?: string; details?: Array<{ code?: string; message?: string; target?: string }>; innererror?: unknown } } | undefined;
+            const sapError = data?.error;
+
+            if (sapError) {
+                const parts: string[] = [];
+                const mainMsg = sapError.message || response.statusText || String(response.status);
+                parts.push(`SAP API Error ${response.status}: ${mainMsg}`);
+                if (sapError.code) parts.push(`Code: ${sapError.code}`);
+                if (Array.isArray(sapError.details) && sapError.details.length > 0) {
+                    const details = sapError.details
+                        .map(d => [d.target ? `[${d.target}] ` : '', d.message].join(''))
+                        .filter(Boolean)
+                        .join(' | ');
+                    parts.push(`Details: ${details}`);
+                }
+                return new Error(parts.join(' — '));
+            }
+
+            return new Error(`SAP API Error ${response.status}: ${response.statusText || String(response.status)}`);
         }
         return error instanceof Error ? error : new Error(String(error));
     }

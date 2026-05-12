@@ -1062,7 +1062,22 @@ export class HierarchicalSAPToolRegistry {
             const serviceId = args.serviceId as string;
             const entityName = args.entityName as string;
             let operation = (args.operation as string)?.toLowerCase();
-            const parameters = args.parameters as Record<string, unknown> || {};
+            // Normalize parameters: handle both flat { key1, key2, field } and nested { keys: {...}, data: {...} } formats
+            const rawParameters = args.parameters as Record<string, unknown> || {};
+            const parameters: Record<string, unknown> = (() => {
+                const keys = rawParameters.keys;
+                const data = rawParameters.data;
+                if (keys && typeof keys === 'object' && !Array.isArray(keys)) {
+                    // Nested format: { keys: { key1: val1 }, data: { field: val } }
+                    return { ...(keys as Record<string, unknown>), ...(typeof data === 'object' && data && !Array.isArray(data) ? data as Record<string, unknown> : {}) };
+                }
+                if (data && typeof data === 'object' && !Array.isArray(data)) {
+                    // Mixed format: { key1: val1, data: { field: val } }
+                    const { data: _data, ...rest } = rawParameters;
+                    return { ...rest, ...(data as Record<string, unknown>) };
+                }
+                return rawParameters;
+            })();
 
             // Validate operation for better Copilot compatibility
             const validOperations = ["read", "read-single", "create", "update", "delete"];
@@ -1271,17 +1286,55 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
-     * Build key value for entity operations (handles single and composite keys)
+     * Format a single key value according to its OData Edm type.
+     * Strings/dates are single-quoted; GUIDs, integers, booleans are unquoted.
+     */
+    private formatKeyValue(value: unknown, type: string): string {
+        switch (type) {
+            case 'Edm.Guid':
+            case 'Edm.Int16':
+            case 'Edm.Int32':
+            case 'Edm.Int64':
+            case 'Edm.Boolean':
+                return String(value);
+            case 'Edm.Decimal':
+                return `${value}M`;
+            case 'Edm.Double':
+                return `${value}d`;
+            default:
+                // Edm.String, Edm.Date, Edm.DateTimeOffset, etc. → single-quoted
+                return `'${value}'`;
+        }
+    }
+
+    /**
+     * Build key value for entity operations (handles single and composite keys).
+     * Returns a pre-formatted segment ready to be wrapped in parentheses by the client.
      */
     private buildKeyValue(entityType: EntityType, parameters: Record<string, unknown>): string {
         const keyProperties = entityType.properties.filter(p => entityType.keys.includes(p.name));
 
         if (keyProperties.length === 1) {
-            const keyName = keyProperties[0].name;
-            if (!(keyName in parameters)) {
-                throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
+            const prop = keyProperties[0];
+            if (!(prop.name in parameters)) {
+                throw new Error(`Missing required key property: ${prop.name}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return String(parameters[keyName]);
+            return this.formatKeyValue(parameters[prop.name], prop.type);
+        }
+
+        if (keyProperties.length === 0 && entityType.keys.length > 0) {
+            // Fallback: keys extracted but properties not found (e.g. unresolved BaseType).
+            // Type is unknown so we default to string quoting — this path should not be
+            // reached in practice after the key extraction fix.
+            const keyParts = entityType.keys.map(keyName => {
+                if (!(keyName in parameters)) {
+                    throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
+                }
+                return entityType.keys.length === 1
+                    ? `'${parameters[keyName]}'`
+                    : `${keyName}='${parameters[keyName]}'`;
+            });
+            return keyParts.join(',');
         }
 
         // Handle composite keys
@@ -1289,7 +1342,7 @@ export class HierarchicalSAPToolRegistry {
             if (!(prop.name in parameters)) {
                 throw new Error(`Missing required key property: ${prop.name}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return `${prop.name}='${parameters[prop.name]}'`;
+            return `${prop.name}=${this.formatKeyValue(parameters[prop.name], prop.type)}`;
         });
         return keyParts.join(',');
     }

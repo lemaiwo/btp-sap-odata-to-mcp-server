@@ -337,11 +337,28 @@ export class SAPToolRegistry {
         );
     }
 
+    private formatKeyValue(value: unknown, type: string): string {
+        switch (type) {
+            case 'Edm.Guid':
+            case 'Edm.Int16':
+            case 'Edm.Int32':
+            case 'Edm.Int64':
+            case 'Edm.Boolean':
+                return String(value);
+            case 'Edm.Decimal':
+                return `${value}M`;
+            case 'Edm.Double':
+                return `${value}d`;
+            default:
+                return `'${value}'`;
+        }
+    }
+
     private buildKeyValue(keyProperties: { name: string; type: string }[], args: Record<string, unknown>): string {
         if (keyProperties.length === 1) {
-            return String(args[keyProperties[0].name]);
+            return this.formatKeyValue(args[keyProperties[0].name], keyProperties[0].type);
         }
-        const keyParts = keyProperties.map(prop => `${prop.name}='${args[prop.name]}'`);
+        const keyParts = keyProperties.map(prop => `${prop.name}=${this.formatKeyValue(args[prop.name], prop.type)}`);
         return keyParts.join(',');
     }
 

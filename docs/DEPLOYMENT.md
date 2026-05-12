@@ -20,30 +20,40 @@ cf login -a https://api.cf.{region}.hana.ondemand.com
 cf target -o your-org -s your-space
 ```
 
-### 2. Configure Destination in BTP
+### 2. Configure Destinations in BTP
 
-You must create a destination in SAP BTP to connect to your on-premise SAP system. This destination should use **Basic Authentication** and the **virtual hostname** configured in SAP Cloud Connector as the URL.
+You must create **two destinations** in SAP BTP: one for service discovery (technical user) and one for execution (principal propagation / SSO).
 
-#### Option 1: Use the default destination name
+#### Destination 1 — Discovery (Technical User)
 
-- Create a destination in BTP with the name `SAP_SYSTEM`.
+Used to list available OData services. Configured via `SAP_DISCOVERY_DESTINATION_NAME` (default: `SAP_SYSTEM_TECH_SBX`).
 
-#### Option 2: Use a custom destination name
-
-- Create a destination in BTP with a name of your choice.
-- Set the environment variable `SAP_DESTINATION_NAME` to your chosen destination name when deploying the application.
-
-#### Example Destination Configuration
-
-- **Name:** SAP_SYSTEM (or your custom name)
+- **Name:** `SAP_SYSTEM_TECH_SBX`
 - **Type:** HTTP
 - **Authentication:** BasicAuthentication
 - **Proxy Type:** OnPremise
-- **User:** [your_sap_username]
-- **Password:** [your_sap_password]
+- **User:** [technical_sap_user]
+- **Password:** [technical_sap_password]
 - **URL:** https://[virtual-hostname]:[port] (as configured in SAP Cloud Connector)
 
-![Example Destination Configuration](./img/destination.png)
+#### Destination 2 — Execution (Principal Propagation / SSO)
+
+Used to execute OData calls on behalf of the connected user. Configured via `SAP_EXECUTION_DESTINATION_NAME` (default: `SAP_SYSTEM_SSO_SBX`).
+
+- **Name:** `SAP_SYSTEM_SSO_SBX`
+- **Type:** HTTP
+- **Authentication:** PrincipalPropagation
+- **Proxy Type:** OnPremise
+- **URL:** https://[virtual-hostname]:[port] (as configured in SAP Cloud Connector)
+
+> **Note:** Principal Propagation requires SAP Cloud Connector to be configured with trust between BTP and the on-premise system. If you prefer Basic Authentication with a different user, use `BasicAuthentication` with the appropriate credentials.
+
+#### Environment Variables (set in `mta.yaml` properties)
+
+```yaml
+SAP_DISCOVERY_DESTINATION_NAME: SAP_SYSTEM_TECH_SBX
+SAP_EXECUTION_DESTINATION_NAME: SAP_SYSTEM_SSO_SBX
+```
 
 For more details on creating destinations, see the [SAP BTP documentation](https://help.sap.com/docs/btp/sap-business-technology-platform/creating-destinations).
 
