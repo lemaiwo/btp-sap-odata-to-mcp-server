@@ -414,7 +414,8 @@ export class HierarchicalSAPToolRegistry {
             // If service matches or no query, include service with minimal entity list
             if (serviceScore > 0 || !query) {
                 const entities = service.metadata?.entityTypes?.map(entity => ({
-                    entityName: entity.name
+                    entityName: entity.name,
+                    entitySet: entity.entitySet
                 })) || [];
 
                 matches.push({
@@ -435,9 +436,10 @@ export class HierarchicalSAPToolRegistry {
             if (service.metadata?.entityTypes && query) {
                 for (const entity of service.metadata.entityTypes) {
                     const entityNameLower = entity.name.toLowerCase();
+                    const entitySetLower = (entity.entitySet || '').toLowerCase();
 
-                    // Match entity name
-                    if (entityNameLower.includes(query)) {
+                    // Match entity name or entity set name
+                    if (entityNameLower.includes(query) || entitySetLower.includes(query)) {
                         matches.push({
                             type: "entity",
                             score: 0.95,
@@ -448,7 +450,8 @@ export class HierarchicalSAPToolRegistry {
                                 categories: this.serviceCategories.get(service.id) || []
                             },
                             entity: {
-                                entityName: entity.name
+                                entityName: entity.name,
+                                entitySet: entity.entitySet
                             },
                             matchReason: `Entity '${entity.name}' matches '${query}'`
                         });
@@ -1059,7 +1062,22 @@ export class HierarchicalSAPToolRegistry {
             const serviceId = args.serviceId as string;
             const entityName = args.entityName as string;
             let operation = (args.operation as string)?.toLowerCase();
-            const parameters = args.parameters as Record<string, unknown> || {};
+            // Normalize parameters: handle both flat { key1, key2, field } and nested { keys: {...}, data: {...} } formats
+            const rawParameters = args.parameters as Record<string, unknown> || {};
+            const parameters: Record<string, unknown> = (() => {
+                const keys = rawParameters.keys;
+                const data = rawParameters.data;
+                if (keys && typeof keys === 'object' && !Array.isArray(keys)) {
+                    // Nested format: { keys: { key1: val1 }, data: { field: val } }
+                    return { ...(keys as Record<string, unknown>), ...(typeof data === 'object' && data && !Array.isArray(data) ? data as Record<string, unknown> : {}) };
+                }
+                if (data && typeof data === 'object' && !Array.isArray(data)) {
+                    // Mixed format: { key1: val1, data: { field: val } }
+                    const { data: _data, ...rest } = rawParameters;
+                    return { ...rest, ...(data as Record<string, unknown>) };
+                }
+                return rawParameters;
+            })();
 
             // Validate operation for better Copilot compatibility
             const validOperations = ["read", "read-single", "create", "update", "delete"];
@@ -1108,13 +1126,30 @@ export class HierarchicalSAPToolRegistry {
                 };
             }
 
-            // Validate entity
-            const entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
+            // Validate entity — accept both EntityType name and EntitySet name as input
+            let entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
             if (!entityType) {
+                entityType = service.metadata?.entityTypes?.find(e => e.entitySet === entityName);
+            }
+            if (!entityType) {
+                const availableEntities = service.metadata?.entityTypes
+                    ?.map(e => e.entitySet ? `${e.name} (entitySet: ${e.entitySet})` : e.name)
+                    .join(', ') || 'none';
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `ERROR: Entity '${entityName}' not found in service '${serviceId}'`
+                        text: `ERROR: Entity '${entityName}' not found in service '${serviceId}'\n\nAvailable entities: ${availableEntities}`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Ensure entity has an accessible EntitySet
+            if (!entityType.entitySet) {
+                return {
+                    content: [{
+                        type: "text" as const,
+                        text: `ERROR: Entity '${entityType.name}' has no EntitySet and cannot be queried directly. It may be a complex type or function return type.`
                     }],
                     isError: true
                 };
@@ -1251,17 +1286,55 @@ export class HierarchicalSAPToolRegistry {
     }
 
     /**
-     * Build key value for entity operations (handles single and composite keys)
+     * Format a single key value according to its OData Edm type.
+     * Strings/dates are single-quoted; GUIDs, integers, booleans are unquoted.
+     */
+    private formatKeyValue(value: unknown, type: string): string {
+        switch (type) {
+            case 'Edm.Guid':
+            case 'Edm.Int16':
+            case 'Edm.Int32':
+            case 'Edm.Int64':
+            case 'Edm.Boolean':
+                return String(value);
+            case 'Edm.Decimal':
+                return `${value}M`;
+            case 'Edm.Double':
+                return `${value}d`;
+            default:
+                // Edm.String, Edm.Date, Edm.DateTimeOffset, etc. → single-quoted
+                return `'${value}'`;
+        }
+    }
+
+    /**
+     * Build key value for entity operations (handles single and composite keys).
+     * Returns a pre-formatted segment ready to be wrapped in parentheses by the client.
      */
     private buildKeyValue(entityType: EntityType, parameters: Record<string, unknown>): string {
         const keyProperties = entityType.properties.filter(p => entityType.keys.includes(p.name));
 
         if (keyProperties.length === 1) {
-            const keyName = keyProperties[0].name;
-            if (!(keyName in parameters)) {
-                throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
+            const prop = keyProperties[0];
+            if (!(prop.name in parameters)) {
+                throw new Error(`Missing required key property: ${prop.name}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return String(parameters[keyName]);
+            return this.formatKeyValue(parameters[prop.name], prop.type);
+        }
+
+        if (keyProperties.length === 0 && entityType.keys.length > 0) {
+            // Fallback: keys extracted but properties not found (e.g. unresolved BaseType).
+            // Type is unknown so we default to string quoting — this path should not be
+            // reached in practice after the key extraction fix.
+            const keyParts = entityType.keys.map(keyName => {
+                if (!(keyName in parameters)) {
+                    throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
+                }
+                return entityType.keys.length === 1
+                    ? `'${parameters[keyName]}'`
+                    : `${keyName}='${parameters[keyName]}'`;
+            });
+            return keyParts.join(',');
         }
 
         // Handle composite keys
@@ -1269,7 +1342,7 @@ export class HierarchicalSAPToolRegistry {
             if (!(prop.name in parameters)) {
                 throw new Error(`Missing required key property: ${prop.name}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return `${prop.name}='${parameters[prop.name]}'`;
+            return `${prop.name}=${this.formatKeyValue(parameters[prop.name], prop.type)}`;
         });
         return keyParts.join(',');
     }
